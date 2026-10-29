@@ -5,7 +5,8 @@ const vm=require('node:vm');
 const path=require('node:path');
 const root=path.join(__dirname,'../src/Bridge/wwwroot');
 function environment({unsupported=null,noSession=false,rejectLive=false}={}) {
-  const elements=new Map(), handlers=new Map(), calls=[], positions=[], requests=[], events={};
+  const elements=new Map(), handlers=new Map(), calls=[], positions=[], requests=[], events={}, timers=new Map(), responses=new Map();
+  let timerId=0;
   let metadataCount=0;
   function element(selector) {
     if(!elements.has(selector)) elements.set(selector,{value:'',classList:{add(){},remove(){},toggle(){}},dataset:{},
@@ -24,15 +25,15 @@ function environment({unsupported=null,noSession=false,rejectLive=false}={}) {
     document:{querySelector:element,addEventListener(){}},
     navigator:noSession?{}:{mediaSession:session},
     window:{MediaMetadata:Metadata,addEventListener:(event,handler)=>events[event]=handler},
-    TrackArtLoader:class{stop(){}watch(){}},setInterval(){},clearTimeout(){},setTimeout(){},
+    TrackArtLoader:class{stop(){}watch(){}},setInterval(){},clearTimeout:id=>timers.delete(id),setTimeout:(callback,delay)=>{const id=++timerId;timers.set(id,{callback,delay});return id;},
     location:{href:'http://127.0.0.1:8090/'},
-    fetch:(url,options)=>{requests.push({url,options});return new Promise(()=>{});}
+    fetch:(url,options)=>{requests.push({url,options});return responses.has(url)?Promise.resolve({ok:true,json:async()=>responses.get(url)}):new Promise(()=>{});}
   });
   vm.runInContext(fs.readFileSync(path.join(root,'media-controls.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(root,'player.js'),'utf8'),context);
   context.fixture={ready:true,revision:7,navigation:{canPrevious:true},
     track:{id:'youtube:AAAAAAAAAAA',provider:'youtube',title:'A',artist:'Artist'}};
-  return {context,session,handlers,calls,positions,requests,events,audio,metadataCount:()=>metadataCount};
+  return {context,session,handlers,calls,positions,requests,events,audio,timers,responses,metadataCount:()=>metadataCount};
 }
 
 const app=environment();
@@ -70,3 +71,22 @@ assert.equal(partial.positions.at(-1),undefined,'Unsupported live position did n
 const absent=environment({noSession:true});
 assert.ok(absent.requests.some(r=>r.url==='/api/status'),'Missing Media Session stopped the player');
 console.log('PASS: partial/missing Media Session support does not stop playback setup');
+
+(async()=>{
+  const network=environment(); vm.runInContext('server=fixture;',network.context);
+  network.responses.set('/api/status',network.context.fixture);
+  network.handlers.get('play')(); network.audio.onplaying(); network.audio.error={code:2};
+  for(let i=0;i<3;i++) {
+    network.audio.onerror(); assert.equal(network.timers.size,1,'Lost connection did not schedule a retry');
+    const [id,timer]=network.timers.entries().next().value; network.timers.delete(id); await timer.callback();
+  }
+  network.audio.onerror(); assert.equal(network.timers.size,0,'Retries were unbounded');
+  assert.equal(network.audio.playCalls,4,'Recovery did not reconnect to the running broadcast');
+  network.audio.onplaying(); network.audio.onerror();
+  const retry=network.timers.values().next().value; network.handlers.get('pause')();
+  assert.equal(network.timers.size,0); await retry.callback(); assert.equal(network.audio.playCalls,4,'Retry revived paused audio');
+  network.handlers.get('play')(); network.audio.onplaying();
+  network.responses.set('/api/status',{...network.context.fixture,ready:false,state:'stopped'});
+  await network.audio.onended(); assert.equal(network.timers.size,0,'Real end-of-song incorrectly reconnected');
+  console.log('PASS: transient disconnect recovery, bounded retries, pause cancels recovery and real EOF stays ended');
+})().catch(error=>{console.error(error);process.exitCode=1;});

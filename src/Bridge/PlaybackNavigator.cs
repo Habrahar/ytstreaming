@@ -4,7 +4,7 @@ public record NavigationPreview(long Revision, long Version, Track[] Previous, T
 
 // Only completed selections enter history. Navigation and manual selection share
 // cancellation, so a slow recommendation cannot replace a newer manual choice.
-public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog, ITrackRecommendations recommendations) : IDisposable
+public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog, ITrackRecommendations recommendations, NextTrackPreparer? preparer = null) : IDisposable
 {
     private readonly object gate = new();
     private readonly List<Track> history = [];
@@ -23,7 +23,7 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
         {
             lock (gate) return new { canPrevious = cursor > 0,
                 canNext = engine.Current?.Provider == "youtube", position = cursor, count = history.Count,
-                version, busy = pending is not null };
+                version, busy = pending is not null, preparation = preparer?.Status };
         }
     }
 
@@ -48,12 +48,15 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
                 history.Count - cursor - 1 < 2 && upcoming.Count == 0;
         }
         if (load) await EnsureUpcomingAsync(seed!, token);
+        NavigationPreview preview;
         lock (gate)
         {
             CheckPreview(revision, expectedVersion);
-            return new(revision, version, history.Take(Math.Max(0, cursor)).Reverse().Take(2).ToArray(),
+            preview = new(revision, version, history.Take(Math.Max(0, cursor)).Reverse().Take(2).ToArray(),
                 history.Skip(cursor + 1).Concat(upcoming).Take(2).ToArray());
+            if (engine.Ready) preparer?.Schedule(preview.Next.FirstOrDefault(), () => engine.Ready);
         }
+        return preview;
     }
 
     private void CheckPreview(long revision, long expectedVersion)
@@ -131,7 +134,7 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
         {
             if (expectedRevision.HasValue && expectedRevision != engine.Revision) throw new SelectionSupersededException();
             pending?.Cancel();
-            if (direction == 0) CancelRadio(clear: true);
+            if (direction == 0) { CancelRadio(clear: true); preparer?.Schedule(null, () => false); }
             pending = own = CancellationTokenSource.CreateLinkedTokenSource(token);
             currentVersion = ++version;
             seed = engine.Current;
@@ -174,6 +177,7 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
                     if (history.Count > 64) history.RemoveAt(0);
                     cursor = history.Count - 1;
                 }
+                preparer?.Schedule(history.Skip(cursor + 1).Concat(upcoming).FirstOrDefault(), () => engine.Ready);
             }
         }
         catch (OperationCanceledException) when (own.IsCancellationRequested) { throw new SelectionSupersededException(); }
@@ -189,7 +193,7 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
 
     public async Task StopAsync()
     {
-        lock (gate) { ++version; pending?.Cancel(); CancelRadio(clear: false); }
+        lock (gate) { ++version; pending?.Cancel(); CancelRadio(clear: false); preparer?.Schedule(null, () => false); }
         await engine.StopPlaybackAsync();
     }
 

@@ -5,6 +5,7 @@ let wantsAudio = false, phase = 'idle', controlRequest = null, refreshing = fals
 let searchRequest = null, searchSequence = 0, searchTimer, intentionalReset = false;
 let completedSearch = '';
 let artworkTrack = null;
+let reconnectTimer=null, reconnectAttempts=0;
 const searchArt = new TrackArtLoader($('#results'));
 const mediaControls = new PlayerMediaControls(navigator.mediaSession,window.MediaMetadata,{
   play:resumePlayback,pause:pausePlayback,
@@ -57,6 +58,7 @@ function render() {
 }
 
 function disconnect() {
+  clearTimeout(reconnectTimer); reconnectTimer=null;
   ++connectionSequence;
   intentionalReset = true;
   audio.pause(); audio.removeAttribute('src'); audio.load();
@@ -69,7 +71,7 @@ function connect(query) {
   disconnect();
   const connection = connectionSequence;
   phase = 'buffering';
-  audio.src = '/stream.mp3?' + query + '&t=' + Date.now();
+  audio.src = '/stream?' + query + '&t=' + Date.now();
   const promise = audio.play();
   render();
   return Promise.resolve(promise).then(() => true).catch(error => {
@@ -77,12 +79,14 @@ function connect(query) {
     if (error.name === 'AbortError') return false;
     phase = error.name === 'NotAllowedError' ? 'gesture' : 'error';
     notice(error.name === 'NotAllowedError' ? 'Браузер ждёт нажатия ▶. Песня уже подготовлена.' : 'Не удалось подключить звук. Нажми ▶ ещё раз.');
+    if(error.name!=='NotAllowedError') reconnect();
     render();
     return false;
   });
 }
 
 function startSelection(track, path, body, direction = null) {
+  reconnectAttempts=0;
   const sequence = ++selectionSequence;
   controlRequest?.abort();
   controlRequest = new AbortController();
@@ -96,6 +100,7 @@ function startSelection(track, path, body, direction = null) {
   Promise.all([command, playing]).then(([status]) => {
     if (sequence !== selectionSequence) return;
     server = status; attachedRevision = status.revision; pending = null;
+    if(wantsAudio && phase==='error' && status.ready) reconnect();
     render();
   }).catch(error => {
     if (sequence !== selectionSequence) return;
@@ -116,11 +121,13 @@ function togglePlayback() {
 }
 
 function pausePlayback() {
+  clearTimeout(reconnectTimer); reconnectTimer=null;
   wantsAudio=false; audio.pause(); phase='paused'; render();
 }
 
 function resumePlayback() {
   notice();
+  reconnectAttempts=0;
   if(pending) {
     if(!wantsAudio) {wantsAudio=true; connect('requestId='+encodeURIComponent(pending.requestId));}
     return;
@@ -220,7 +227,7 @@ $('#stop').onclick=async()=>{
   ++selectionSequence; controlRequest?.abort(); pending=null; wantsAudio=false; disconnect(); phase='idle'; render();
   try { server=await api('/api/player/stop',{}); render(); } catch(error) { notice(error.message); }
 };
-audio.onplaying=()=>{ mediaControls.register(); phase='playing'; notice(); render(); };
+audio.onplaying=()=>{ reconnectAttempts=0; mediaControls.register(); phase='playing'; notice(); render(); };
 audio.addEventListener('loadedmetadata',()=>mediaControls.register());
 window.addEventListener('pageshow',()=>{mediaControls.register(); render();});
 audio.onwaiting=()=>{ if(wantsAudio) { phase='buffering'; render(); } };
@@ -236,11 +243,30 @@ audio.onended=async()=>{
     if(status.ready && attachedRevision!==status.revision) {
       attachedRevision=status.revision; connect('revision='+status.revision); return;
     }
+    if(status.ready) {reconnect(); return;}
     // A different phone may be changing the common stream. Follow its new
     // revision when ready instead of treating the closed old response as EOF.
     if(status.pending || status.state==='starting') return;
     phase='ended'; wantsAudio=false; render();
   } catch { phase='error'; notice('Связь прервалась. Нажми ▶ для подключения.'); render(); }
 };
-audio.onerror=()=>{ if(!intentionalReset && !pending && wantsAudio) { phase='error'; notice('Звук прервался. Нажми ▶ для подключения.'); render(); } };
+function reconnect() {
+  if(pending || !wantsAudio || reconnectTimer) return;
+  if(reconnectAttempts>=3) {phase='error'; notice('Связь прервалась. Нажми ▶ для подключения.'); render(); return;}
+  const sequence=selectionSequence, delay=[500,1500,3000][reconnectAttempts++];
+  phase='buffering'; notice(); render();
+  reconnectTimer=setTimeout(async()=>{
+    reconnectTimer=null;
+    if(sequence!==selectionSequence || pending || !wantsAudio) return;
+    try {
+      const status=await api('/api/status');
+      if(sequence!==selectionSequence || pending || !wantsAudio) return;
+      server=status;
+      if(status.ready) {attachedRevision=status.revision; connect('revision='+status.revision);}
+      else if(status.pending || status.state==='starting') reconnect();
+      else {wantsAudio=false; phase=status.state==='error'?'error':'ended'; render();}
+    } catch {reconnect();}
+  },delay);
+}
+audio.onerror=()=>{ if(audio.error && !intentionalReset && !pending && wantsAudio) reconnect(); };
 search(); refresh(); setInterval(refresh,1500);

@@ -10,6 +10,7 @@ builder.Services.AddSingleton<MusicCatalog>();
 builder.Services.AddSingleton<IMusicProvider>(sp => sp.GetRequiredService<MusicCatalog>());
 builder.Services.AddSingleton<AudioEngine>();
 builder.Services.AddSingleton<PlaybackNavigator>();
+builder.Services.AddSingleton<NextTrackPreparer>();
 builder.Services.AddSingleton<MusicLibrary>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AudioEngine>());
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 4096);
@@ -72,7 +73,7 @@ app.MapGet("/healthz", (AudioEngine engine) => Results.Json(
 app.MapGet("/health/live", (AudioEngine engine) => Results.Json(
     new { state = engine.State }, statusCode: engine.State == "error" ? 503 : 200));
 app.MapGet("/listen.m3u", (HttpRequest request) => Results.Text(
-    $"#EXTM3U\n#EXTINF:-1,ytstreaming\n{request.Scheme}://{request.Host}/stream.mp3\n", "audio/x-mpegurl"));
+    $"#EXTM3U\n#EXTINF:-1,ytstreaming\n{request.Scheme}://{request.Host}/stream\n", "audio/x-mpegurl"));
 app.MapGet("/api/status", (AudioEngine engine, PlaybackNavigator navigator) => Results.Json(PlayerStatus(engine, navigator)));
 app.MapGet("/api/player/neighbors", (long revision, long version, PlaybackNavigator navigator, HttpContext context) =>
     navigator.PreviewAsync(revision, version, context.RequestAborted));
@@ -131,7 +132,7 @@ app.MapPost("/api/player/stop", async (AudioEngine engine, PlaybackNavigator nav
     await navigator.StopAsync();
     return Results.Ok(PlayerStatus(engine, navigator));
 });
-app.MapGet("/stream.mp3", async (HttpContext context, AudioEngine engine) =>
+var serveAudio = async (HttpContext context, AudioEngine engine) =>
 {
     var requestId = context.Request.Query["requestId"].ToString();
     var revisionText = context.Request.Query["revision"].ToString();
@@ -163,7 +164,7 @@ app.MapGet("/stream.mp3", async (HttpContext context, AudioEngine engine) =>
         context.Response.StatusCode = 429;
         return;
     }
-    context.Response.ContentType = "audio/mpeg";
+    context.Response.ContentType = listener.Value.ContentType;
     context.Response.Headers.CacheControl = "no-store";
     context.Response.Headers["X-Accel-Buffering"] = "no";
     try
@@ -177,7 +178,9 @@ app.MapGet("/stream.mp3", async (HttpContext context, AudioEngine engine) =>
     catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { }
     catch (IOException) { /* A player disconnected. */ }
     finally { engine.Unsubscribe(listener.Value.Id); }
-});
+};
+app.MapGet("/stream", serveAudio);
+app.MapGet("/stream.mp3", serveAudio); // Legacy address, with the actual MIME type.
 app.Run();
 
 record PlayRequest(string Id, string? RequestId = null);

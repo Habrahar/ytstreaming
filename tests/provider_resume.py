@@ -30,6 +30,51 @@ class Handler:
 
 
 class ResumeCheck(unittest.TestCase):
+    def test_buffered_prefix_is_sent_before_upstream_and_not_repeated(self):
+        handler=Handler(); ranges=[]
+        class Session:
+            def __enter__(self): return self
+            def __exit__(self,*_): pass
+            def get(self,_,headers,stream):
+                self_before=handler.wfile.getvalue()
+                if self_before!=b'abc': raise AssertionError('Prefix was not sent first')
+                ranges.append(headers.get('Range'))
+                return Response(206,[b'def'],{'Content-Range':'bytes 3-5/6','Content-Length':'3'})
+        with patch.object(server,'NetworkSession',Session):
+            server.forward_audio(handler,'unused',{},(b'abc','audio/mp4',6))
+        self.assertEqual(handler.wfile.getvalue(),b'abcdef'); self.assertEqual(ranges,['bytes=3-'])
+        self.assertEqual(handler.statuses,[200])
+
+    def test_range_entirely_in_prefix_needs_no_network(self):
+        handler=Handler(); handler.headers={'Range':'bytes=1-2'}
+        with patch.object(server,'NetworkSession') as network:
+            server.forward_audio(handler,'unused',{},(b'abcdef','audio/mp4',100))
+            network.assert_not_called()
+        self.assertEqual(handler.wfile.getvalue(),b'bc'); self.assertEqual(handler.statuses,[206])
+
+    def test_worker_is_reused_between_successful_requests(self):
+        original=server.EXTRACTOR_PATH
+        with tempfile.TemporaryDirectory() as folder:
+            helper=Path(folder)/'worker.py'
+            helper.write_text('import json,sys\nprint(json.dumps({"ready":True}),flush=True)\nfor line in sys.stdin: print(json.dumps({"result":{"id":line.strip()}}),flush=True)\n')
+            try:
+                with patch.object(server,'EXTRACTOR_PATH',helper):
+                    self.assertEqual(server.extract_source('AAAAAAAAAAA')['id'],'AAAAAAAAAAA')
+                    process=server.extractor_worker
+                    self.assertEqual(server.extract_source('BBBBBBBBBBB')['id'],'BBBBBBBBBBB')
+                    self.assertIs(server.extractor_worker,process)
+            finally: server.stop_extractor()
+
+    def test_source_cache_preserves_quality_metadata(self):
+        info={'url':'https://media.googlevideo.com/audio','headers':{},'codec':'mp4a.40.2',
+              'bitrateKbps':129.5,'sampleRate':44100,'channels':2,'strategy':'visionos',
+              'extractMilliseconds':200,'probeMilliseconds':100}
+        with patch.dict(server.audio_cache,{},clear=True), patch.object(server,'extract_source',return_value=info) as extract:
+            first=server.resolve('AAAAAAAAAAA'); cached=server.resolve('AAAAAAAAAAA')
+            self.assertEqual(first['codec'],'mp4a.40.2')
+            self.assertEqual(cached['codec'],first['codec']); self.assertEqual(cached['bitrateKbps'],129.5)
+            self.assertEqual(cached['strategy'],'cache'); extract.assert_called_once()
+
     def test_carousel_card_has_separate_cache_and_does_not_fetch_radio(self):
         urls=[]
         class Session:

@@ -24,6 +24,13 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     private string? sourceStrategy;
     private int sourceExtractMilliseconds;
     private int sourceProbeMilliseconds;
+    private double? sourceBitrateKbps;
+    private string outputCodec = "mp3";
+    private bool nativeCopy;
+    private long aheadBytes, maxGapMilliseconds, slowDisconnects;
+    private readonly Queue<AudioPacket> replay = new();
+    private int replayBytes;
+    private double replaySeconds;
     private readonly object listenersLock = new();
     private readonly Dictionary<Guid, Channel<byte[]>> listeners = new();
     private Process? process;
@@ -34,6 +41,7 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     private volatile string state = "stopped";
     public Track? Current { get; private set; }
     public string State => state;
+    public string ContentType { get; private set; } = "audio/mpeg";
     public long Revision => Interlocked.Read(ref revision);
     public string? ActiveRequestId => activeRequestId;
     public string? LatestRequestId => latestRequestId;
@@ -48,8 +56,11 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
                 revision = Revision, requestId = activeRequestId, latestRequestId, error = lastError,
                 resolveMilliseconds, startupMilliseconds,
                 sourceStrategy, sourceExtractMilliseconds, sourceProbeMilliseconds,
+                sourceBitrateKbps, outputCodec, outputMode = nativeCopy ? "copy" : "encode", contentType = ContentType,
+                bufferedSourceBytes = Interlocked.Read(ref aheadBytes), maxOutputGapMilliseconds = Interlocked.Read(ref maxGapMilliseconds),
+                slowClientDisconnects = Interlocked.Read(ref slowDisconnects),
                 listeners = listeners.Count, bytesSentToHub = Interlocked.Read(ref bytes),
-                stream = "/stream.mp3", provider = Current?.Provider,
+                stream = "/stream", provider = Current?.Provider,
                 youtubeMusic = string.IsNullOrEmpty(config["YOUTUBE_PROVIDER_URL"]) ? "not-configured" : "enabled" };
         }
     }
@@ -98,6 +109,13 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
             sourceStrategy = source.Strategy;
             sourceExtractMilliseconds = source.ExtractMilliseconds;
             sourceProbeMilliseconds = source.ProbeMilliseconds;
+            sourceBitrateKbps = source.BitrateKbps;
+            nativeCopy = !source.Loop && config["AUDIO_PASSTHROUGH"] != "false" &&
+                (source.Codec?.StartsWith("mp4a.", StringComparison.Ordinal) == true || source.Codec == "aac");
+            outputCodec = nativeCopy ? "aac" : "mp3";
+            ContentType = nativeCopy ? "audio/aac" : "audio/mpeg";
+            Interlocked.Exchange(ref aheadBytes, 0); Interlocked.Exchange(ref maxGapMilliseconds, 0); Interlocked.Exchange(ref slowDisconnects, 0);
+            lock (listenersLock) { replay.Clear(); replayBytes = 0; replaySeconds = 0; }
             startupMilliseconds = 0;
             startedAtTicks = Stopwatch.GetTimestamp();
             var info = new ProcessStartInfo(config["FFMPEG_PATH"] ?? "ffmpeg")
@@ -105,18 +123,21 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
                 RedirectStandardOutput = true, RedirectStandardError = true,
                 UseShellExecute = false, CreateNoWindow = true
             };
-            List<string> arguments = ["-hide_banner", "-loglevel", "warning", "-nostdin", "-re"];
+            List<string> arguments = ["-hide_banner", "-loglevel", "warning", "-nostdin"];
+            if (!nativeCopy) arguments.Add("-re");
             if (source.Loop) arguments.AddRange(["-stream_loop", "-1"]);
-            else arguments.AddRange(["-rw_timeout", "20000000", "-probesize", "65536", "-analyzeduration", "1000000"]);
-            arguments.AddRange(["-i", source.Location, "-vn", "-threads", "1",
-                "-c:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "2",
-                "-write_xing", "0", "-id3v2_version", "0", "-flush_packets", "1", "-f", "mp3", "pipe:1"]);
+            else arguments.AddRange(["-rw_timeout", "20000000", "-probesize", "32768", "-analyzeduration", nativeCopy ? "1" : "1000000"]);
+            arguments.AddRange(["-i", source.Location, "-vn", "-threads", "1"]);
+            if (nativeCopy) arguments.AddRange(["-c:a", "copy", "-f", "adts"]);
+            else arguments.AddRange(["-c:a", "libmp3lame", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+                "-write_xing", "0", "-id3v2_version", "0", "-f", "mp3"]);
+            arguments.AddRange(["-flush_packets", "1", "pipe:1"]);
             foreach (var argument in arguments) info.ArgumentList.Add(argument);
             process = Process.Start(info) ?? throw new InvalidOperationException("Cannot start FFmpeg");
             playback = new CancellationTokenSource();
             Interlocked.Exchange(ref bytes, 0);
             Interlocked.Exchange(ref lastDataTicks, 0);
-            pump = PumpAsync(process, playback.Token);
+            pump = PumpAsync(process, nativeCopy, playback.Token);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
@@ -146,33 +167,47 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
         }
     }
 
-    private async Task PumpAsync(Process encoder, CancellationToken token)
+    private void Publish(byte[] chunk, double seconds)
+    {
+        var now = DateTime.UtcNow.Ticks;
+        var previous = Interlocked.Read(ref lastDataTicks);
+        if (Interlocked.Read(ref bytes) == 0) startupMilliseconds = (long)Stopwatch.GetElapsedTime(startedAtTicks).TotalMilliseconds;
+        else if (previous > 0)
+        {
+            var gap = (now - previous) / TimeSpan.TicksPerMillisecond;
+            if (gap > Interlocked.Read(ref maxGapMilliseconds)) Interlocked.Exchange(ref maxGapMilliseconds, gap);
+        }
+        Interlocked.Add(ref bytes, chunk.Length); Interlocked.Exchange(ref lastDataTicks, now); state = "playing";
+        lock (listenersLock)
+        {
+            replay.Enqueue(new(chunk,seconds)); replayBytes += chunk.Length; replaySeconds += seconds;
+            while ((replayBytes > 65536 || replaySeconds > 4) && replay.Count > 1)
+            {
+                var old = replay.Dequeue(); replayBytes -= old.Bytes.Length; replaySeconds -= old.Seconds;
+            }
+            foreach (var pair in listeners.ToArray())
+                if (!pair.Value.Writer.TryWrite(chunk))
+                {
+                    Interlocked.Increment(ref slowDisconnects);
+                    pair.Value.Writer.TryComplete(); listeners.Remove(pair.Key);
+                }
+        }
+    }
+
+    private async Task PumpAsync(Process encoder, bool copy, CancellationToken token)
     {
         var stderr = ReadErrorsAsync(encoder, token);
         try
         {
-            var buffer = new byte[4096];
-            while (true)
+            if (copy) await NativeAacPump.RunAsync(encoder.StandardOutput.BaseStream, packet => Publish(packet.Bytes,packet.Seconds), delta => Interlocked.Add(ref aheadBytes, delta), token);
+            else
             {
-                var count = await encoder.StandardOutput.BaseStream.ReadAsync(buffer, token);
-                if (count == 0) break;
-                var chunk = buffer.AsSpan(0, count).ToArray();
-                if (Interlocked.Read(ref bytes) == 0)
-                    startupMilliseconds = (long)Stopwatch.GetElapsedTime(startedAtTicks).TotalMilliseconds;
-                Interlocked.Add(ref bytes, count);
-                Interlocked.Exchange(ref lastDataTicks, DateTime.UtcNow.Ticks);
-                state = "playing";
-                lock (listenersLock)
+                var buffer = new byte[4096];
+                while (true)
                 {
-                    foreach (var pair in listeners.ToArray())
-                    {
-                        // Disconnect slow players instead of retaining unbounded audio.
-                        if (!pair.Value.Writer.TryWrite(chunk))
-                        {
-                            pair.Value.Writer.TryComplete();
-                            listeners.Remove(pair.Key);
-                        }
-                    }
+                    var count = await encoder.StandardOutput.BaseStream.ReadAtLeastAsync(buffer, buffer.Length, false, token);
+                    if (count == 0) break;
+                    Publish(buffer.AsSpan(0, count).ToArray(),count / 24000.0);
                 }
             }
             await encoder.WaitForExitAsync(token);
@@ -190,7 +225,7 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
             log.LogError(ex, "Audio encoder failed");
             CompleteListeners();
         }
-        finally { await stderr; }
+        finally { Interlocked.Exchange(ref aheadBytes, 0); await stderr; }
     }
 
     private async Task ReadErrorsAsync(Process encoder, CancellationToken token)
@@ -203,18 +238,19 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
     }
 
-    public (Guid Id, ChannelReader<byte[]> Reader)? Subscribe(long? expectedRevision = null)
+    public (Guid Id, ChannelReader<byte[]> Reader, string ContentType)? Subscribe(long? expectedRevision = null)
     {
         lock (listenersLock)
         {
             if (!Ready || listeners.Count >= 8 || (expectedRevision.HasValue && expectedRevision != Revision)) return null;
             var id = Guid.NewGuid();
-            var channel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(32)
+            var channel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(64)
             {
                 FullMode = BoundedChannelFullMode.Wait, SingleReader = true, SingleWriter = true
             });
+            foreach (var chunk in replay) channel.Writer.TryWrite(chunk.Bytes);
             listeners.Add(id, channel);
-            return (id, channel.Reader);
+            return (id, channel.Reader, ContentType);
         }
     }
     public void Unsubscribe(Guid id)

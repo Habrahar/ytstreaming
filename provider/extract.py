@@ -1,5 +1,6 @@
 """Disposable extraction process with a validated fast client and standard fallback."""
 import json
+import base64
 import os
 import re
 import signal
@@ -31,11 +32,22 @@ def validate_audio(info, proxy):
     with requests.Session() as session:
         session.trust_env = False
         if proxy: session.proxies.update({'http':proxy,'https':proxy})
-        with session.get(source, headers={**headers,'Range':'bytes=0-4095'}, stream=True, timeout=(5,8)) as response:
+        with session.get(source, headers={**headers,'Range':'bytes=0-65535'}, stream=True, timeout=(5,8)) as response:
             response.raise_for_status()
-            if not next(response.iter_content(4096), b''):
+            prefix = bytearray()
+            for chunk in response.iter_content(4096):
+                prefix.extend(chunk[:65536-len(prefix)])
+                if len(prefix) >= 65536: break
+            if not prefix:
                 raise ValueError('Empty audio')
-    return {'url':source,'headers':headers,'unsupported':False}
+            match = re.fullmatch(r'bytes 0-\d+/(\d+)', response.headers.get('Content-Range',''))
+            total = int(match[1]) if response.status_code == 206 and match else int(response.headers.get('Content-Length','0')) if response.status_code == 200 else 0
+            content_type = response.headers.get('Content-Type','application/octet-stream').split(';')[0]
+    return {'url':source,'headers':headers,'unsupported':False,
+            'codec':info.get('acodec'),'bitrateKbps':info.get('abr'),
+            'sampleRate':info.get('asr'),'channels':info.get('audio_channels'),
+            'prefix':base64.b64encode(prefix).decode() if total >= len(prefix) else None,
+            'totalBytes':total,'mimeType':content_type}
 
 
 def prepare(video_id):
@@ -77,6 +89,15 @@ def prepare(video_id):
 
 
 if __name__ == '__main__':
+    if sys.argv[1] == '--worker':
+        print(json.dumps({'ready':True}), flush=True)
+        for line in sys.stdin:
+            video_id=line.strip()
+            try:
+                if not re.fullmatch(r'[a-zA-Z0-9_-]{11}',video_id): raise ValueError('Invalid ID')
+                print(json.dumps({'result':prepare(video_id)}),flush=True)
+            except Exception: print(json.dumps({'error':True}),flush=True)
+        raise SystemExit(0)
     video_id = sys.argv[1]
     if not re.fullmatch(r'[a-zA-Z0-9_-]{11}', video_id): raise SystemExit(2)
     try: print(json.dumps(prepare(video_id)))

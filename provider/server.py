@@ -1,5 +1,7 @@
 """Internal-only YouTube catalog and audio adapter; no public listening port."""
 import json
+import base64
+import atexit
 import os
 import re
 import select
@@ -25,6 +27,7 @@ metadata_slots = threading.BoundedSemaphore(2)
 catalog_lock = threading.Lock()
 cache_lock = threading.Lock()
 audio_cache = OrderedDict()
+prefix_cache = OrderedDict()
 track_cache = OrderedDict()
 radio_cache = OrderedDict()
 artwork_cache = OrderedDict()
@@ -140,34 +143,79 @@ class ResolveCancelled(Exception): pass
 
 
 EXTRACTOR_PATH = Path(__file__).with_name('extract.py')
+extractor_lock = threading.Lock()
+extractor_worker = None
+
+
+def stop_extractor():
+    global extractor_worker
+    process, extractor_worker = extractor_worker, None
+    if process is None: return
+    if process.poll() is None:
+        try: os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError: pass
+        try: process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try: os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+            process.wait()
+    for pipe in (process.stdin,process.stdout):
+        if pipe: pipe.close()
+
+
+def worker_message(process, cancelled, deadline):
+    data=bytearray()
+    while True:
+        if cancelled and cancelled(): raise ResolveCancelled()
+        if time.monotonic()>deadline: raise TimeoutError('Source preparation timed out')
+        readable,_,_=select.select([process.stdout],[],[],.1)
+        if readable:
+            chunk=os.read(process.stdout.fileno(),65536)
+            if not chunk: raise ValueError('Extraction worker stopped')
+            data.extend(chunk)
+            if len(data)>196608: raise ValueError('Oversized extraction response')
+            if b'\n' in data:
+                line,rest=data.split(b'\n',1)
+                if rest: raise ValueError('Unexpected extraction response')
+                return json.loads(line)
+
+
+def ready_extractor(cancelled,deadline):
+    global extractor_worker
+    if extractor_worker is not None and extractor_worker.poll() is not None: stop_extractor()
+    if extractor_worker is None:
+        extractor_worker=subprocess.Popen([sys.executable,str(EXTRACTOR_PATH),'--worker'],
+            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True,bufsize=0)
+        if worker_message(extractor_worker,cancelled,deadline).get('ready') is not True:
+            raise ValueError('Extraction worker not ready')
+    return extractor_worker
 
 
 def extract_source(video_id, cancelled=None):
-    process = subprocess.Popen([sys.executable, str(EXTRACTOR_PATH), video_id],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     deadline = time.monotonic() + 65
+    while not extractor_lock.acquire(timeout=.1):
+        if cancelled and cancelled(): raise ResolveCancelled()
+        if time.monotonic()>deadline: raise TimeoutError('Extraction busy')
     try:
-        while True:
-            if cancelled and cancelled():
-                raise ResolveCancelled()
-            if time.monotonic() > deadline:
-                raise TimeoutError('Source preparation timed out')
-            try:
-                output, _ = process.communicate(timeout=.1)
-                if process.returncode:
-                    raise ValueError('Source unavailable')
-                return json.loads(output)
-            except subprocess.TimeoutExpired:
-                continue
-    finally:
-        if process.poll() is None:
-            # Kill the whole process group, including Node. The next selection
-            # must not wait behind work that its listener has already abandoned.
-            os.killpg(process.pid, signal.SIGTERM)
-            try: process.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.communicate()
+        try:
+            process=ready_extractor(cancelled,deadline)
+            process.stdin.write((video_id+'\n').encode()); process.stdin.flush()
+            message=worker_message(process,cancelled,deadline)
+        except BaseException:
+            stop_extractor() # Still kill the entire group, including Node.
+            raise
+        if message.get('error'): raise ValueError('Source unavailable')
+        return message['result']
+    finally: extractor_lock.release()
+
+
+def prime_extractor():
+    with extractor_lock:
+        try: ready_extractor(None,time.monotonic()+30)
+        except Exception: stop_extractor()
+
+
+atexit.register(stop_extractor)
 
 
 def resolve(video_id, cancelled=None):
@@ -175,7 +223,7 @@ def resolve(video_id, cancelled=None):
         cached = audio_cache.get(video_id)
         if cached is not None and time.monotonic() - cached[0] < 1200:
             audio_cache.move_to_end(video_id)
-            return {'strategy':'cache','extractMilliseconds':0,'probeMilliseconds':0}
+            return {**cached[3],'strategy':'cache','extractMilliseconds':0,'probeMilliseconds':0}
     info = extract_source(video_id, cancelled)
     if info.get("unsupported"):
         raise ValueError("Unsupported source")
@@ -187,14 +235,23 @@ def resolve(video_id, cancelled=None):
     # The disposable helper has already validated the first audio bytes, including
     # the fast client's URL. Do not repeat that network round trip here.
     with cache_lock:
-        audio_cache[video_id] = (time.monotonic(), source, headers)
+        details = {key:info.get(key) for key in ('strategy','extractMilliseconds','probeMilliseconds','codec','bitrateKbps','sampleRate','channels')}
+        audio_cache[video_id] = (time.monotonic(), source, headers, details)
+        prefix_cache.pop(video_id,None)
+        if info.get('prefix') and isinstance(info.get('totalBytes'),int):
+            data=base64.b64decode(info['prefix'],validate=True)
+            if 0<len(data)<=65536 and info['totalBytes']>=len(data):
+                mime=info.get('mimeType','')
+                if mime not in ('audio/mp4','video/mp4','audio/webm','video/webm','application/octet-stream'): mime='application/octet-stream'
+                prefix_cache[video_id]=(source,data,mime,info['totalBytes'])
+                while len(prefix_cache)>8: prefix_cache.popitem(last=False)
         audio_cache.move_to_end(video_id)
         while len(audio_cache) > 24:
             audio_cache.popitem(last=False)
-    return {key:info.get(key) for key in ('strategy','extractMilliseconds','probeMilliseconds')}
+    return details
 
 
-def forward_audio(handler, source, headers):
+def forward_audio(handler, source, headers, prefix=None):
     """Resume interrupted upstream downloads without repeating already sent bytes."""
     requested = handler.headers.get("Range", "")
     if requested and not re.fullmatch(r"bytes=\d+-\d*", requested):
@@ -203,6 +260,20 @@ def forward_audio(handler, source, headers):
     end = requested.split("-", 1)[1] if requested else ""
     started = False
     remaining = None
+    if prefix and position<len(prefix[0]):
+        data,mime,total=prefix
+        last=min(total-1,int(end)) if end else total-1
+        if last<position: raise ValueError('Invalid audio range')
+        handler.send_response(206 if requested else 200)
+        handler.send_header('Content-Type',mime)
+        handler.send_header('Content-Length',str(last-position+1))
+        handler.send_header('Accept-Ranges','bytes')
+        if requested: handler.send_header('Content-Range',f'bytes {position}-{last}/{total}')
+        handler.send_header('Connection','close'); handler.end_headers(); handler.close_connection=True
+        stop=min(len(data),last+1)
+        handler.wfile.write(data[position:stop]); handler.wfile.flush()
+        position=stop; remaining=last-position+1; started=True
+        if remaining==0:return
     for attempt in range(4):
         upstream_headers = dict(headers)
         if requested or started:
@@ -230,10 +301,12 @@ def forward_audio(handler, source, headers):
                     for chunk in response.iter_content(4096):
                         if not chunk:
                             continue
+                        if remaining is not None: chunk=chunk[:remaining]
                         handler.wfile.write(chunk)
                         position += len(chunk)
                         if remaining is not None:
                             remaining -= len(chunk)
+                            if remaining==0:return
                     if remaining is None or remaining <= 0:
                         return
                     raise requests.ConnectionError("Truncated audio")
@@ -308,10 +381,11 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/audio":
                 with cache_lock:
                     cached = audio_cache.get(video_id)
+                    prefix = prefix_cache.get(video_id)
                 if cached is None or time.monotonic() - cached[0] > 1800:
                     return self.send_json(410, {"error": "Открой трек заново."})
-                _, source, headers = cached
-                forward_audio(self, source, headers)
+                _, source, headers, _ = cached
+                forward_audio(self, source, headers, prefix[1:] if prefix and prefix[0]==source else None)
                 return
             return self.send_json(404, {"error": "Unknown endpoint"})
         except (BrokenPipeError, ConnectionResetError, ResolveCancelled):
@@ -321,6 +395,7 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/audio":
                 with cache_lock:
                     audio_cache.pop(video_id, None)
+                    prefix_cache.pop(video_id,None)
                 self.close_connection = True
             else:
                 self.send_json(502, {"error": "YouTube недоступен с Raspberry Pi или не отдал аудио. Проверь подключение и прокси."})
@@ -329,4 +404,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    threading.Thread(target=prime_extractor,daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", 8081), Handler).serve_forever()

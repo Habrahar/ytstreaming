@@ -22,6 +22,7 @@ services:
     environment:
       YOUTUBE_PROVIDER_URL: http://provider:8081
       LIBRARY_DIRECTORY: /data
+      AUDIO_PASSTHROUGH: ${AUDIO_PASSTHROUGH:-true}
       DOTNET_GCHeapHardLimit: "0x4000000"
       Logging__LogLevel__Default: Warning
       Logging__LogLevel__Microsoft.AspNetCore: Warning

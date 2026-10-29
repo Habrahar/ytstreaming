@@ -9,9 +9,17 @@ public interface ITrackRecommendations
     Task<Track[]> RelatedAsync(Track track, CancellationToken cancellationToken = default);
 }
 
-public sealed class YoutubeProvider(IConfiguration config) : ITrackRecommendations
+public sealed class YoutubeProvider(IConfiguration config, HttpClient? httpClient = null) : ITrackRecommendations
 {
-    private readonly HttpClient client = new() { Timeout = TimeSpan.FromSeconds(75) };
+    private readonly HttpClient client = httpClient ?? new() { Timeout = TimeSpan.FromSeconds(75) };
+    private readonly object resolveLock = new();
+    private readonly Dictionary<string, ResolveJob> resolving = new();
+    private sealed class ResolveJob
+    {
+        public readonly CancellationTokenSource Cancellation = new();
+        public Task<AudioSource> Work = null!;
+        public int Readers;
+    }
     private readonly object cacheLock = new();
     private readonly Dictionary<string, Track> known = new();
     private string BaseUrl => (config["YOUTUBE_PROVIDER_URL"] ?? "").TrimEnd('/');
@@ -80,6 +88,36 @@ public sealed class YoutubeProvider(IConfiguration config) : ITrackRecommendatio
 
     public async Task<AudioSource> ResolveAudioAsync(Track track, CancellationToken cancellationToken = default)
     {
+        ResolveJob job;
+        lock (resolveLock)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!resolving.TryGetValue(track.Id, out job!))
+            {
+                job = new();
+                resolving[track.Id] = job;
+                var own = job;
+                job.Work = Task.Run(() => ResolveCoreAsync(track, own.Cancellation.Token));
+            }
+            ++job.Readers;
+        }
+        try { return await job.Work.WaitAsync(cancellationToken); }
+        finally
+        {
+            lock (resolveLock)
+            {
+                if (--job.Readers == 0)
+                {
+                    resolving.Remove(track.Id);
+                    if (!job.Work.IsCompleted) job.Cancellation.Cancel();
+                    _ = job.Work.ContinueWith(task => { _ = task.Exception; job.Cancellation.Dispose(); }, TaskScheduler.Default);
+                }
+            }
+        }
+    }
+
+    private async Task<AudioSource> ResolveCoreAsync(Track track, CancellationToken cancellationToken)
+    {
         if (!Enabled || !track.Id.StartsWith("youtube:", StringComparison.Ordinal))
             throw new ProviderException("Неизвестный источник.");
         var id = Uri.EscapeDataString(track.Id[8..]);
@@ -99,7 +137,8 @@ public sealed class YoutubeProvider(IConfiguration config) : ITrackRecommendatio
                     throw new ProviderException("Не удалось получить эту запись YouTube. Попробуй другую версию трека.");
                 var resolution = await response.Content.ReadFromJsonAsync<Resolution>(cancellationToken);
                 return new AudioSource(BaseUrl + "/audio?id=" + id, false, resolution?.Strategy,
-                    resolution?.ExtractMilliseconds ?? 0, resolution?.ProbeMilliseconds ?? 0);
+                    resolution?.ExtractMilliseconds ?? 0, resolution?.ProbeMilliseconds ?? 0,
+                    resolution?.Codec, resolution?.BitrateKbps, resolution?.SampleRate, resolution?.Channels);
             }
             throw new ProviderException("Источник занят. Попробуй ещё раз.");
         }
@@ -108,5 +147,6 @@ public sealed class YoutubeProvider(IConfiguration config) : ITrackRecommendatio
         catch { throw new ProviderException("Не удалось подготовить трек YouTube. Текущий эфир сохранён."); }
     }
 
-    private sealed record Resolution(string? Strategy, int ExtractMilliseconds, int ProbeMilliseconds);
+    private sealed record Resolution(string? Strategy, int ExtractMilliseconds, int ProbeMilliseconds,
+        string? Codec, double? BitrateKbps, int? SampleRate, int? Channels);
 }

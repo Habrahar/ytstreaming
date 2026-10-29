@@ -67,8 +67,8 @@ else:
         assert status['state'] != 'error', status
         time.sleep(.1)
     else: raise AssertionError('Audio not ready')
-    with urllib.request.urlopen(base + '/stream.mp3?revision=' + str(status['revision']), timeout=20) as response:
-        assert response.headers.get_content_type() == 'audio/mpeg' and len(response.read(4096)) == 4096
+    with urllib.request.urlopen(base + '/stream?revision=' + str(status['revision']), timeout=20) as response:
+        assert response.headers.get_content_type() in ('audio/mpeg','audio/aac') and len(response.read(4096)) == 4096
     with urllib.request.urlopen(base + '/api/artwork/' + video_id + '?size=small', timeout=30) as response:
         assert response.headers.get_content_type().startswith('image/') and len(response.read()) > 100
     print('PASS: likes, playlists, metadata and links survived restart; stored track plays without searching; artwork loads', flush=True)

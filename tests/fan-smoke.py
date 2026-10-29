@@ -28,8 +28,8 @@ def playable(path, body, track_id):
         time.sleep(.1)
     else: raise AssertionError('No audio')
     assert status['track']['id'] == track_id
-    with urllib.request.urlopen(base + '/stream.mp3?revision=' + str(status['revision']), timeout=20) as response:
-        assert response.headers.get_content_type() == 'audio/mpeg' and len(response.read(4096)) == 4096
+    with urllib.request.urlopen(base + '/stream?revision=' + str(status['revision']), timeout=20) as response:
+        assert response.headers.get_content_type() in ('audio/mpeg','audio/aac') and len(response.read(4096)) == 4096
     print('PASS: plays ' + status['track']['title'], flush=True)
     return status
 

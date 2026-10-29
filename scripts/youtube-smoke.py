@@ -35,7 +35,7 @@ for _ in range(90):
     time.sleep(.5)
 else:
     raise AssertionError("YouTube audio did not become ready")
-with urllib.request.urlopen(base + "/stream.mp3", timeout=20) as response:
+with urllib.request.urlopen(base + "/stream", timeout=20) as response:
     sample = response.read(32768)
-    assert len(sample) == 32768 and response.headers.get_content_type() == "audio/mpeg"
-print("PASS: live catalog -> resolve -> Pi transcoding -> HTTP MP3;", track["id"])
+    assert len(sample) == 32768 and response.headers.get_content_type() in ("audio/mpeg","audio/aac")
+print("PASS: live catalog -> resolve -> Pi audio -> HTTP stream;", track["id"])
