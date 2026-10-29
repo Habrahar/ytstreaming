@@ -42,11 +42,11 @@ before = api('/api/library')
 seed = before['tracks'][0]['track']  # Existing isolated library fixture.
 a = playable('/api/player/play', {'id': seed['id'], 'requestId': 'fan-seed'}, seed['id'])
 first = preview(a)
-assert not first['previous'] and len(first['next']) == 2
+assert not first['previous'] and len(first['next']) >= 2
 assert preview(a) == first and api('/api/status')['revision'] == a['revision']
 with urllib.request.urlopen(base + '/api/artwork/' + first['next'][0]['id'][8:] + '?size=card', timeout=30) as response:
     assert response.headers.get_content_type().startswith('image/') and len(response.read()) > 100
-b_id, c_id = (t['id'] for t in first['next'])
+b_id, c_id = (t['id'] for t in first['next'][:2])
 b = playable('/api/player/next', {'requestId': 'fan-next', 'expectedId': b_id, 'expectedRevision': a['revision']}, b_id)
 second = preview(b)
 assert second['previous'][0]['id'] == seed['id'] and second['next'][0]['id'] == c_id

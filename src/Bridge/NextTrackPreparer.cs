@@ -11,6 +11,10 @@ public sealed class NextTrackPreparer(IMusicProvider provider) : IDisposable
     private DateTime readyAt;
     public object Status { get { lock (gate) return new { preparing = cancellation is null ? null : desired,
         ready = DateTime.UtcNow - readyAt < TimeSpan.FromMinutes(15) ? readyTrackId : null }; } }
+    public void CancelUnless(string? trackId)
+    {
+        lock (gate) if (desired != trackId) Schedule(null, () => false);
+    }
     public void Schedule(Track? track, Func<bool> audioReady)
     {
         lock (gate)

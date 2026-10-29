@@ -1,6 +1,6 @@
 namespace Bridge;
 
-public record NavigationPreview(long Revision, long Version, Track[] Previous, Track[] Next);
+public record NavigationPreview(long Revision, long Version, Track[] Previous, Track[] Next, Track? Track = null);
 
 // Only completed selections enter history. Navigation and manual selection share
 // cancellation, so a slow recommendation cannot replace a newer manual choice.
@@ -11,6 +11,21 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
     private int cursor = -1;
     private long version;
     private CancellationTokenSource? pending;
+    private string? pendingRequestId;
+    private SelectionPlan? plan;
+    private readonly Dictionary<string, (long Sequence, long Order)> clients = new();
+    private long commandOrder;
+    private sealed class SelectionPlan(IEnumerable<Track> tracks, int historyCount, int queueStart, long position)
+    {
+        public readonly List<Track> Tracks = tracks.ToList();
+        public readonly int HistoryCount = historyCount, QueueStart = queueStart;
+        public long Start, Position = position;
+        public long CommittedPosition = position, GroupOrigin;
+        public string? GroupId;
+        public Track[] RetryQueue = [];
+        public Track? At(long index) => index >= Start && index - Start < Tracks.Count ? Tracks[(int)(index - Start)] : null;
+        public IEnumerable<Track> After(long index) => Tracks.Skip((int)Math.Clamp(index + 1 - Start, 0, Tracks.Count));
+    }
     private readonly List<Track> upcoming = [];
     private long queueGeneration;
     private RadioLoad? radio;
@@ -21,47 +36,55 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
     {
         get
         {
-            lock (gate) return new { canPrevious = cursor > 0,
-                canNext = engine.Current?.Provider == "youtube", position = cursor, count = history.Count,
+            lock (gate) return new { canPrevious = plan is { } p ? p.Position > p.Start : cursor > 0,
+                canNext = (plan?.At(plan.Position) ?? engine.Current)?.Provider == "youtube", position = cursor, count = history.Count,
+                target = pending is null ? null : plan?.At(plan.Position), requestId = pending is null ? null : pendingRequestId,
                 version, busy = pending is not null, preparation = preparer?.Status };
         }
     }
 
     public Track? Find(string id)
     {
-        lock (gate) return history.LastOrDefault(track => track.Id == id) ?? upcoming.FirstOrDefault(track => track.Id == id);
+        lock (gate) return history.LastOrDefault(track => track.Id == id) ?? upcoming.FirstOrDefault(track => track.Id == id)
+            ?? plan?.Tracks.FirstOrDefault(track => track.Id == id);
     }
 
-    public Task PlayAsync(Track track, string? requestId, CancellationToken token = default) => ChangeAsync(track, 0, requestId, token);
-    public Task NextAsync(string? requestId, CancellationToken token = default, string? expectedId = null, long? expectedRevision = null) => ChangeAsync(null, 1, requestId, token, expectedId, expectedRevision);
-    public Task PreviousAsync(string? requestId, CancellationToken token = default, string? expectedId = null, long? expectedRevision = null) => ChangeAsync(null, -1, requestId, token, expectedId, expectedRevision);
+    public Task PlayAsync(Track track, string? requestId, CancellationToken token = default, string? clientId = null, long? commandSequence = null) => ChangeAsync(track, 0, requestId, token, clientId: clientId, commandSequence: commandSequence);
+    public Task NextAsync(string? requestId, CancellationToken token = default, string? expectedId = null, long? expectedRevision = null, string? clientId = null, long? commandSequence = null, string? navigationId = null, long? navigationOffset = null, Track? anchor = null) => ChangeAsync(null, 1, requestId, token, expectedId, expectedRevision, clientId, commandSequence, navigationId, navigationOffset, anchor);
+    public Task PreviousAsync(string? requestId, CancellationToken token = default, string? expectedId = null, long? expectedRevision = null, string? clientId = null, long? commandSequence = null, string? navigationId = null, long? navigationOffset = null, Track? anchor = null) => ChangeAsync(null, -1, requestId, token, expectedId, expectedRevision, clientId, commandSequence, navigationId, navigationOffset, anchor);
 
     public async Task<NavigationPreview> PreviewAsync(long revision, long expectedVersion, CancellationToken token = default)
     {
         Track? seed;
+        SelectionPlan? selectionPlan;
         bool load;
         lock (gate)
         {
             CheckPreview(revision, expectedVersion);
+            selectionPlan = plan;
             seed = history.LastOrDefault() ?? engine.Current;
-            load = seed?.Provider == "youtube" && engine.LatestRequestId is not null &&
+            load = selectionPlan is null && seed?.Provider == "youtube" && engine.LatestRequestId is not null &&
                 history.Count - cursor - 1 < 2 && upcoming.Count == 0;
         }
+        if (selectionPlan is not null) await EnsurePlanAsync(selectionPlan, selectionPlan.Position + 2, token);
         if (load) await EnsureUpcomingAsync(seed!, token);
         NavigationPreview preview;
         lock (gate)
         {
             CheckPreview(revision, expectedVersion);
-            preview = new(revision, version, history.Take(Math.Max(0, cursor)).Reverse().Take(2).ToArray(),
-                history.Skip(cursor + 1).Concat(upcoming).Take(2).ToArray());
-            if (engine.Ready) preparer?.Schedule(preview.Next.FirstOrDefault(), () => engine.Ready);
+            preview = plan is { } p
+                ? new(revision, version, p.Tracks.Take((int)Math.Clamp(p.Position - p.Start, 0, p.Tracks.Count)).Reverse().Take(64).ToArray(),
+                    p.After(p.Position).ToArray(), p.At(p.Position))
+                : new(revision, version, history.Take(Math.Max(0, cursor)).Reverse().Take(64).ToArray(),
+                    history.Skip(cursor + 1).Concat(upcoming).ToArray(), engine.Current);
+            if (pending is null && engine.Ready) preparer?.Schedule(preview.Next.FirstOrDefault(), () => engine.Ready);
         }
         return preview;
     }
 
     private void CheckPreview(long revision, long expectedVersion)
     {
-        if (engine.Revision != revision || version != expectedVersion || pending is not null) throw new SelectionSupersededException();
+        if (engine.Revision != revision || version != expectedVersion) throw new SelectionSupersededException();
     }
 
     private async Task EnsureUpcomingAsync(Track seed, CancellationToken token)
@@ -74,7 +97,7 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
             if (upcoming.Count > 0) return;
             if (radio is null)
             {
-                radio = new(seed, queueGeneration, history.Select(t => t.Id).ToHashSet(), new(),
+                radio = new(seed, queueGeneration, history.Concat(plan?.Tracks ?? []).Select(t => t.Id).ToHashSet(), new(),
                     new(TaskCreationOptions.RunContinuationsAsynchronously));
                 start = true;
             }
@@ -122,54 +145,124 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
         if (clear) upcoming.Clear();
     }
 
-    private async Task ChangeAsync(Track? selected, int direction, string? requestId, CancellationToken token,
-        string? expectedId = null, long? expectedRevision = null)
+    private void AcceptCommand(string? clientId, long? sequence)
     {
-        CancellationTokenSource own;
-        long currentVersion;
-        int? targetPosition = null;
-        Track? seed;
-        bool fromQueue = false;
-        lock (gate)
+        if (clientId is null && sequence is null) return; // Older API clients.
+        if (string.IsNullOrWhiteSpace(clientId) || clientId.Length > 64 || sequence is null or < 1)
+            throw new ProviderException("Некорректная команда плеера.");
+        if (clients.TryGetValue(clientId, out var previous) && sequence <= previous.Sequence)
+            throw new SelectionSupersededException();
+        if (!clients.ContainsKey(clientId) && clients.Count >= 64) clients.Remove(clients.MinBy(pair => pair.Value.Order).Key);
+        clients[clientId] = (sequence.Value, ++commandOrder);
+    }
+
+    private void AdoptUpcoming(SelectionPlan selectionPlan)
+    {
+        selectionPlan.Tracks.AddRange(upcoming); upcoming.Clear();
+        if (selectionPlan.RetryQueue.Length == 0)
+            selectionPlan.RetryQueue = selectionPlan.After(Math.Max(selectionPlan.CommittedPosition, selectionPlan.HistoryCount - 1)).Take(12).ToArray();
+        // A long burst may cross several recommendation pages. Keep a bounded
+        // window and absolute positions so skipped metadata cannot grow forever.
+        var remove = (int)Math.Min(Math.Max(0, selectionPlan.Tracks.Count - 128), Math.Max(0, selectionPlan.Position - selectionPlan.Start - 64));
+        if (remove > 0) { selectionPlan.Tracks.RemoveRange(0, remove); selectionPlan.Start += remove; }
+    }
+
+    private async Task EnsurePlanAsync(SelectionPlan selectionPlan, long position, CancellationToken token)
+    {
+        while (true)
         {
-            if (expectedRevision.HasValue && expectedRevision != engine.Revision) throw new SelectionSupersededException();
-            pending?.Cancel();
-            if (direction == 0) { CancelRadio(clear: true); preparer?.Schedule(null, () => false); }
-            pending = own = CancellationTokenSource.CreateLinkedTokenSource(token);
-            currentVersion = ++version;
-            seed = engine.Current;
-            if (direction < 0 && cursor > 0) targetPosition = cursor - 1;
-            if (direction > 0 && cursor + 1 < history.Count) targetPosition = cursor + 1;
-            if (targetPosition.HasValue) selected = history[targetPosition.Value];
-        }
-        try
-        {
-            if (selected is null)
+            Track? seed;
+            lock (gate)
             {
-                if (direction < 0) throw new ProviderException("В истории пока нет предыдущей песни.");
-                if (seed?.Provider == "youtube")
-                {
-                    await EnsureUpcomingAsync(seed, own.Token);
-                    lock (gate) selected = upcoming.FirstOrDefault();
-                    if (selected is null) throw new ProviderException("YouTube не предложил следующую песню.");
-                    fromQueue = true;
-                }
-                else
+                token.ThrowIfCancellationRequested();
+                if (plan != selectionPlan) throw new SelectionSupersededException();
+                AdoptUpcoming(selectionPlan);
+                if (selectionPlan.At(position) is not null) return;
+                if (position < selectionPlan.Start) throw new SelectionSupersededException();
+                seed = selectionPlan.Tracks.LastOrDefault() ?? engine.Current;
+                if (seed?.Provider != "youtube")
                 {
                     var tracks = catalog.Search(null);
                     var index = Array.FindIndex(tracks, track => track.Id == seed?.Id);
-                    selected = tracks[(index + 1) % tracks.Length];
+                    upcoming.Add(tracks[(index + 1) % tracks.Length]);
+                    continue;
                 }
             }
-            own.Token.ThrowIfCancellationRequested();
-            if (expectedId is not null && selected.Id != expectedId) throw new SelectionSupersededException();
+            await EnsureUpcomingAsync(seed, token);
+        }
+    }
+
+    private async Task ChangeAsync(Track? selected, int direction, string? requestId, CancellationToken token,
+        string? expectedId = null, long? expectedRevision = null, string? clientId = null, long? commandSequence = null,
+        string? navigationId = null, long? navigationOffset = null, Track? anchor = null)
+    {
+        CancellationTokenSource own;
+        SelectionPlan selectionPlan;
+        long currentVersion, targetPosition;
+        bool completed = false;
+        lock (gate)
+        {
+            AcceptCommand(clientId, commandSequence);
+            if (expectedRevision.HasValue && expectedRevision != engine.Revision) throw new SelectionSupersededException();
+            if ((navigationId is null) != (navigationOffset is null) || navigationId?.Length is 0 or > 64)
+                throw new ProviderException("Некорректная команда переключения.");
+            if (direction == 0 || (anchor is not null && plan?.GroupId != navigationId && (plan?.At(plan.Position) ?? engine.Current)?.Id != anchor.Id))
+            {
+                CancelRadio(clear: true); preparer?.Schedule(null, () => false);
+                var prefix = history.Take(cursor + 1).ToList();
+                var count = prefix.Count;
+                var initial = direction == 0 ? selected! : anchor!;
+                if (prefix.LastOrDefault()?.Id != initial.Id) prefix.Add(initial);
+                plan = new(prefix, count, prefix.Count, prefix.Count - 1);
+            }
+            else if (plan is null)
+            {
+                plan = new(history.Concat(upcoming), history.Count, history.Count, cursor);
+                plan.RetryQueue = upcoming.ToArray();
+                upcoming.Clear();
+                if (plan.Tracks.Count == 0 && engine.Current is { } current)
+                { plan.Tracks.Add(current); plan.Position = 0; }
+            }
+            selectionPlan = plan!;
+            if (navigationId is not null && selectionPlan.GroupId != navigationId)
+            { selectionPlan.GroupId = navigationId; selectionPlan.GroupOrigin = selectionPlan.Position; }
+            targetPosition = navigationId is null ? selectionPlan.Position + direction : checked(selectionPlan.GroupOrigin + navigationOffset!.Value);
+            if (targetPosition < selectionPlan.Start) throw new ProviderException("В истории пока нет предыдущей песни.");
+            selected = selectionPlan.At(targetPosition);
+            if (expectedId is not null && selected is not null && selected.Id != expectedId) throw new SelectionSupersededException();
+            selectionPlan.Position = targetPosition; // Advance before any network/audio await.
+            var previous = pending;
+            pending = own = CancellationTokenSource.CreateLinkedTokenSource(token);
+            pendingRequestId = requestId ??= Guid.NewGuid().ToString("N");
+            currentVersion = ++version;
+            // Cancellation can run the previous task's finally synchronously.
+            // Publish its replacement first so it cannot roll back this plan.
+            previous?.Cancel();
+            preparer?.CancelUnless(selected?.Id);
+        }
+        try
+        {
+            await EnsurePlanAsync(selectionPlan, targetPosition, own.Token);
+            lock (gate)
+            {
+                own.Token.ThrowIfCancellationRequested();
+                if (plan != selectionPlan || currentVersion != version) throw new SelectionSupersededException();
+                selected = selectionPlan.At(targetPosition)!;
+                if (expectedId is not null && selected.Id != expectedId) throw new SelectionSupersededException();
+                preparer?.CancelUnless(selected.Id);
+            }
             await engine.PlayAsync(selected, requestId, own.Token);
             lock (gate)
             {
                 own.Token.ThrowIfCancellationRequested();
                 if (currentVersion != version) throw new SelectionSupersededException();
-                if (fromQueue && upcoming.FirstOrDefault()?.Id == selected.Id) upcoming.RemoveAt(0);
-                if (targetPosition.HasValue) cursor = targetPosition.Value;
+                var remaining = selectionPlan.After(Math.Max(targetPosition, selectionPlan.HistoryCount - 1)).Concat(upcoming).ToArray();
+                var heard = targetPosition < selectionPlan.CommittedPosition
+                    ? cursor > 0 ? history.FindLastIndex(cursor - 1, cursor, t => t.Id == selected.Id) : -1
+                    : targetPosition > selectionPlan.CommittedPosition
+                        ? history.FindIndex(Math.Min(history.Count, cursor + 1), t => t.Id == selected.Id)
+                        : cursor >= 0 && history[cursor].Id == selected.Id ? cursor : -1;
+                if (heard >= 0) cursor = heard;
                 else if (cursor < 0 || history[cursor].Id != selected.Id)
                 {
                     if (cursor + 1 < history.Count) history.RemoveRange(cursor + 1, history.Count - cursor - 1);
@@ -177,7 +270,12 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
                     if (history.Count > 64) history.RemoveAt(0);
                     cursor = history.Count - 1;
                 }
-                preparer?.Schedule(history.Skip(cursor + 1).Concat(upcoming).FirstOrDefault(), () => engine.Ready);
+                upcoming.Clear();
+                selectionPlan.CommittedPosition = targetPosition;
+                selectionPlan.RetryQueue = remaining.Take(12).ToArray();
+                if (navigationId is null) { upcoming.AddRange(remaining); plan = null; }
+                completed = true;
+                preparer?.Schedule(plan?.After(targetPosition).FirstOrDefault() ?? history.Skip(cursor + 1).Concat(upcoming).FirstOrDefault(), () => engine.Ready);
             }
         }
         catch (OperationCanceledException) when (own.IsCancellationRequested) { throw new SelectionSupersededException(); }
@@ -185,15 +283,31 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
         {
             lock (gate)
             {
-                if (ReferenceEquals(pending, own)) pending = null;
+                if (ReferenceEquals(pending, own))
+                {
+                    if (!completed && plan == selectionPlan) RestoreQueue();
+                    pending = null; pendingRequestId = null;
+                }
                 own.Dispose();
             }
         }
     }
 
-    public async Task StopAsync()
+    private void RestoreQueue()
     {
-        lock (gate) { ++version; pending?.Cancel(); CancelRadio(clear: false); preparer?.Schedule(null, () => false); }
+        if (plan is not { } p) return;
+        var queued = p.RetryQueue.Concat(upcoming).DistinctBy(t => t.Id).Take(12).ToArray();
+        upcoming.Clear(); upcoming.AddRange(queued); plan = null;
+    }
+
+    public async Task StopAsync(string? clientId = null, long? commandSequence = null)
+    {
+        lock (gate)
+        {
+            AcceptCommand(clientId, commandSequence);
+            ++version; var previous = pending; pending = null; pendingRequestId = null; previous?.Cancel();
+            RestoreQueue(); CancelRadio(clear: false); preparer?.Schedule(null, () => false);
+        }
         await engine.StopPlaybackAsync();
     }
 

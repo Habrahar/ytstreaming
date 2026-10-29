@@ -112,24 +112,30 @@ app.MapPost("/api/player/play", async (PlayRequest request, AudioEngine engine, 
     if (request.RequestId?.Length > 64) return Results.BadRequest();
     var track = FindTrack(request.Id, provider, navigator, engine, library);
     if (track is null) return Results.NotFound(new { error = "Unknown track" });
-    await navigator.PlayAsync(track, request.RequestId, context.RequestAborted);
+    await navigator.PlayAsync(track, request.RequestId, context.RequestAborted, request.ClientId, request.CommandSequence);
     return Results.Ok(PlayerStatus(engine, navigator));
 });
-app.MapPost("/api/player/next", async (NavigationRequest request, AudioEngine engine, PlaybackNavigator navigator, HttpContext context) =>
+app.MapPost("/api/player/next", async (NavigationRequest request, AudioEngine engine, PlaybackNavigator navigator, MusicCatalog catalog, MusicLibrary library, HttpContext context) =>
 {
     if (request.RequestId?.Length > 64 || request.ExpectedId?.Length > 64) return Results.BadRequest();
-    await navigator.NextAsync(request.RequestId, context.RequestAborted, request.ExpectedId, request.ExpectedRevision);
+    var anchor = FindTrack(request.AnchorId, catalog, navigator, engine, library);
+    if (request.AnchorId is not null && anchor is null) return Results.NotFound(new { error = "Песня не найдена." });
+    await navigator.NextAsync(request.RequestId, context.RequestAborted, request.ExpectedId, request.ExpectedRevision,
+        request.ClientId, request.CommandSequence, request.NavigationId, request.NavigationOffset, anchor);
     return Results.Ok(PlayerStatus(engine, navigator));
 });
-app.MapPost("/api/player/previous", async (NavigationRequest request, AudioEngine engine, PlaybackNavigator navigator, HttpContext context) =>
+app.MapPost("/api/player/previous", async (NavigationRequest request, AudioEngine engine, PlaybackNavigator navigator, MusicCatalog catalog, MusicLibrary library, HttpContext context) =>
 {
     if (request.RequestId?.Length > 64 || request.ExpectedId?.Length > 64) return Results.BadRequest();
-    await navigator.PreviousAsync(request.RequestId, context.RequestAborted, request.ExpectedId, request.ExpectedRevision);
+    var anchor = FindTrack(request.AnchorId, catalog, navigator, engine, library);
+    if (request.AnchorId is not null && anchor is null) return Results.NotFound(new { error = "Песня не найдена." });
+    await navigator.PreviousAsync(request.RequestId, context.RequestAborted, request.ExpectedId, request.ExpectedRevision,
+        request.ClientId, request.CommandSequence, request.NavigationId, request.NavigationOffset, anchor);
     return Results.Ok(PlayerStatus(engine, navigator));
 });
-app.MapPost("/api/player/stop", async (AudioEngine engine, PlaybackNavigator navigator) =>
+app.MapPost("/api/player/stop", async (ControlRequest request, AudioEngine engine, PlaybackNavigator navigator) =>
 {
-    await navigator.StopAsync();
+    await navigator.StopAsync(request.ClientId, request.CommandSequence);
     return Results.Ok(PlayerStatus(engine, navigator));
 });
 var serveAudio = async (HttpContext context, AudioEngine engine) =>
@@ -183,8 +189,10 @@ app.MapGet("/stream", serveAudio);
 app.MapGet("/stream.mp3", serveAudio); // Legacy address, with the actual MIME type.
 app.Run();
 
-record PlayRequest(string Id, string? RequestId = null);
-record NavigationRequest(string? RequestId = null, string? ExpectedId = null, long? ExpectedRevision = null);
+record PlayRequest(string Id, string? RequestId = null, string? ClientId = null, long? CommandSequence = null);
+record NavigationRequest(string? RequestId = null, string? ExpectedId = null, long? ExpectedRevision = null,
+    string? ClientId = null, long? CommandSequence = null, string? NavigationId = null, long? NavigationOffset = null, string? AnchorId = null);
+record ControlRequest(string? ClientId = null, long? CommandSequence = null);
 record LikeRequest(string Id, bool Liked);
 record PlaylistRequest(string? Name);
 record MembershipRequest(string Id, bool Added);

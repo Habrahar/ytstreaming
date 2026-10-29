@@ -5,7 +5,7 @@
   initial.parentElement.replaceChild(rail,initial); wrapper.append(initial); rail.append(wrapper);
   const cards=new Map([['empty',{node:wrapper,face:initial,image:initial.querySelector('img'),track:null,slot:0}]]);
   let currentId=null, view=[null,null,null,null,null], preview=null, previewKey='', requestKey='', request=null, retryAt=0;
-  let state=null, busy=false, gesture=null, suppressClickUntil=0;
+  let state=null, busy=false, gesture=null, suppressClickUntil=0, selectionId=null;
   const q=selector=>document.querySelector(selector);
   function makeCard(track,key) {
     const node=document.createElement('div'); node.className='fan-item entering';
@@ -20,8 +20,8 @@
     face.append(record,image); node.append(face,caption); rail.append(node);
     const card={node,face,image,track,slot:0,caption,title,artist}; cards.set(key,card);
     face.onclick=()=>{
-      if(Date.now()<suppressClickUntil || busy) return;
-      if(card.slot===0) togglePlayback();
+      if(Date.now()<suppressClickUntil) return;
+      if(card.slot===0 && !busy) togglePlayback();
       else if(Math.abs(card.slot)===1 && card.track) navigate(card.slot<0?'previous':'next');
     };
     return card;
@@ -40,9 +40,9 @@
       if(card.caption && !item) {
         card.title.textContent=slot<0?'История пуста':requestKey?'Подбираем музыку…':'Следующая песня'; card.artist.textContent='';
       }
-      card.face.disabled=busy || !item || Math.abs(slot)>1; card.face.tabIndex=card.face.disabled?-1:0;
+      card.face.disabled=(busy && slot===0) || !item || Math.abs(slot)>1; card.face.tabIndex=card.face.disabled?-1:0;
       card.face.setAttribute('aria-label',item?(slot<0?'Предыдущая песня: ':slot>0?'Следующая песня: ':'Воспроизвести или приостановить: ')+item.title:'');
-      if(item && (!preparing || slot===0)) {
+      if(item) {
         const url='/api/artwork/'+encodeURIComponent(item.id.slice(8))+(slot===0?'':'?size=card');
         card.image.fetchPriority=slot===0?'high':'low';
         if(card.image.getAttribute('src')!==url) card.image.src=url;
@@ -62,31 +62,49 @@
     request?.abort(); const own=request=new AbortController(); requestKey=key;
     try {
       const value=await api('/api/player/neighbors?revision='+status.revision+'&version='+status.navigation.version,undefined,own.signal);
-      if(own!==request || currentId!==track.id || busy) return;
+      if(own!==request || currentId!==track.id || value.track?.id!==track.id) return;
       preview=value; previewKey=key; retryAt=0; view=fromPreview(track,value); layout(track,view,false);
     } catch(error) {
-      if(error.name!=='AbortError' && own===request) retryAt=Date.now()+10000;
+      if(error.name!=='AbortError' && own===request) retryAt=error.status===409?0:Date.now()+10000;
     } finally {if(own===request) {requestKey=''; request=null;}}
   }
   function sync(track,status,selection) {
     state=status; busy=!!selection || !!status?.navigation?.busy;
+    if(selectionId!==(selection?.requestId||null)) {
+      selectionId=selection?.requestId||null; request?.abort(); request=null; requestKey='';
+    }
     if(track?.provider!=='youtube') track=null;
+    if(selection && !selection.exact) {
+      currentId=track?.id; preview=null; previewKey=''; view=[null,null,track,null,null];
+      layout(track,view,true); return;
+    }
     if(currentId!==track?.id) {
-      const position=track?view.findIndex(t=>t?.id===track.id):-1;
-      view=position>=0?Array.from({length:5},(_,i)=>view[i+position-2]||null):[null,null,track,null,null];
-      view[2]=track; currentId=track?.id; preview=null; previewKey=''; retryAt=0;
+      const ordered=preview?[...preview.previous].reverse().concat(view[2]?[view[2]]:[],preview.next):view;
+      const centre=preview?preview.previous.length:2;
+      let position=track?ordered.findIndex((t,i)=>t?.id===track.id && (selection?.direction==='next'?i>centre:selection?.direction==='previous'?i<centre:true)):-1;
+      if(selection && !selection.direction) position=-1;
+      if(selection?.direction==='previous') for(let i=centre-1;i>=0;i--) if(ordered[i]?.id===track?.id) {position=i;break;}
+      if(position>=0) {
+        preview={previous:ordered.slice(0,position).reverse(),next:ordered.slice(position+1),track};
+        view=fromPreview(track,preview);
+      } else {
+        const actual=status?.track?.provider==='youtube' && status.navigation?.count>0?status.track:null;
+        view=[null,selection && !selection.direction && actual?.id!==track?.id?actual:null,track,null,null]; preview=null;
+      }
+      view[2]=track; currentId=track?.id; previewKey=''; retryAt=0;
       request?.abort(); request=null; requestKey='';
     }
-    if(busy && request) {request.abort(); request=null; requestKey='';}
     layout(track,view,busy);
-    if(!track || busy || !status || (!status.ready && status.state!=='stopped')) return;
+    const target=status?.navigation?.target||status?.track;
+    if(!track || !status || target?.id!==track.id || (selection && status.navigation?.requestId!==selection.requestId)) return;
     const key=status.revision+':'+status.navigation.version;
     if(key!==previewKey && key!==requestKey && Date.now()>=retryAt) loadPreview(key,status,track);
   }
   window.coverFan={sync,target:direction=>view[direction==='previous'?1:3],
+    canPrevious:()=>preview?preview.previous.length>0:view[1]?true:undefined,
     expected:direction=>({expectedId:view[direction==='previous'?1:3]?.id,expectedRevision:state?.revision})};
   deck.addEventListener('pointerdown',event=>{
-    if(event.button!==0 || !event.isPrimary || busy || !currentId) return;
+    if(event.button!==0 || !event.isPrimary || !currentId) return;
     gesture={id:event.pointerId,x:event.clientX,y:event.clientY,active:false};
   });
   deck.addEventListener('pointermove',event=>{
@@ -107,14 +125,14 @@
     suppressClickUntil=Date.now()+400;
     if(!cancelled && Math.abs(dx)>44) {
       const direction=dx<0?'next':'previous';
-      if(direction==='next' || state?.navigation?.canPrevious) navigate(direction);
+      navigate(direction);
     }
   }
   deck.addEventListener('pointerup',event=>endGesture(event));
   deck.addEventListener('pointercancel',event=>endGesture(event,true));
   deck.addEventListener('keydown',event=>{
-    if(!busy && ['ArrowLeft','ArrowRight'].includes(event.key)) {
-      event.preventDefault(); if(event.key==='ArrowRight' || state?.navigation?.canPrevious) navigate(event.key==='ArrowRight'?'next':'previous');
+    if(['ArrowLeft','ArrowRight'].includes(event.key)) {
+      event.preventDefault(); navigate(event.key==='ArrowRight'?'next':'previous');
     }
   });
 })();

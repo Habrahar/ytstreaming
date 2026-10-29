@@ -6,11 +6,12 @@ let searchRequest = null, searchSequence = 0, searchTimer, intentionalReset = fa
 let completedSearch = '';
 let artworkTrack = null;
 let reconnectTimer=null, reconnectAttempts=0;
+const clientId=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
+let navigationBurst=null;
 const searchArt = new TrackArtLoader($('#results'));
 const mediaControls = new PlayerMediaControls(navigator.mediaSession,window.MediaMetadata,{
   play:resumePlayback,pause:pausePlayback,
-  previous:()=>{if(server?.navigation?.canPrevious) navigate('previous');},
-  next:()=>{if(server?.track?.provider==='youtube') navigate('next');}
+  previous:()=>navigate('previous'), next:()=>navigate('next')
 });
 function stopThumbnails(release=false) { searchArt.stop(release); }
 function watchThumbnails() { searchArt.watch(); }
@@ -20,13 +21,13 @@ async function api(path, body, signal) {
     method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
   })});
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || 'Не удалось связаться с плеером.');
+  if (!response.ok) {const error=new Error(data.error || 'Не удалось связаться с плеером.'); error.status=response.status; throw error;}
   return data;
 }
 
 function notice(text = '') { $('#message').textContent = text; }
 function render() {
-  const track = pending?.track || server?.track;
+  const track = pending?.track || server?.navigation?.target || server?.track;
   const isMusic = track?.provider === 'youtube';
   $('#title').textContent = isMusic ? track.title : 'Найди свою музыку';
   $('#artist').textContent = isMusic ? track.artist : 'Начни с поиска наверху';
@@ -45,8 +46,8 @@ function render() {
   $('#status').textContent = status;
   $('#player').dataset.phase = pending ? 'preparing' : phase;
   $('#play').disabled = !!pending || !isMusic;
-  $('#previous').disabled = !!pending || !server?.navigation?.canPrevious;
-  $('#next').disabled = !!pending || !isMusic;
+  $('#previous').disabled = !canNavigate('previous');
+  $('#next').disabled = !isMusic;
   const playing = wantsAudio && !audio.paused && !['error','gesture','ended'].includes(phase);
   $('#play').setAttribute('aria-label', playing ? 'Пауза' : 'Воспроизвести');
   $('#playIcon').textContent = playing ? 'Ⅱ' : '▶';
@@ -85,34 +86,49 @@ function connect(query) {
   });
 }
 
-function startSelection(track, path, body, direction = null) {
+function startSelection(track, path, body, direction = null, exact = true) {
   reconnectAttempts=0;
   const sequence = ++selectionSequence;
-  controlRequest?.abort();
+  // The new command cancels the old server job after advancing its selection.
+  // Aborting its HTTP request first could roll that selection back before Next.
   controlRequest = new AbortController();
   const requestId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
-  pending = {track, requestId, direction};
+  pending = {track, requestId, direction, exact};
   wantsAudio = true;
   attachedRevision = -1;
   notice(); closeSearch(); render();
-  const command = api(path, {...body, requestId}, controlRequest.signal);
+  const command = api(path, {...body, requestId, clientId, commandSequence:sequence}, controlRequest.signal);
   const playing = connect('requestId=' + encodeURIComponent(requestId));
   Promise.all([command, playing]).then(([status]) => {
     if (sequence !== selectionSequence) return;
-    server = status; attachedRevision = status.revision; pending = null;
+    server = status; attachedRevision = status.revision; pending = null; navigationBurst=null;
     if(wantsAudio && phase==='error' && status.ready) reconnect();
     render();
   }).catch(error => {
     if (sequence !== selectionSequence) return;
-    pending = null; wantsAudio = false; disconnect();
+    pending = null; navigationBurst=null; wantsAudio = false; disconnect();
     phase = 'error'; notice(error.message); render();
   });
 }
 
-function choose(track) { startSelection(track, '/api/player/play', {id:track.id}); }
+function choose(track) { navigationBurst=null; startSelection(track, '/api/player/play', {id:track.id}); }
+function canNavigate(direction) {
+  if((pending?.track || server?.navigation?.target || server?.track)?.provider!=='youtube') return false;
+  if(direction==='next') return true;
+  const known=window.coverFan?.canPrevious();
+  if(pending && !pending.exact && navigationBurst?.offset>0) return true;
+  return known ?? !!server?.navigation?.canPrevious;
+}
 function navigate(direction) {
-  if (!server?.track || pending) return;
-  startSelection(window.coverFan?.target(direction)||server.track, '/api/player/'+direction, window.coverFan?.expected(direction)||{}, direction);
+  if (!canNavigate(direction)) return;
+  if(!navigationBurst) navigationBurst={id:Date.now().toString(36)+'-'+Math.random().toString(36).slice(2),offset:0,
+    anchorId:pending && !pending.direction?pending.track?.id:undefined};
+  navigationBurst.offset+=direction==='next'?1:-1;
+  const target=(!pending || pending.exact)?window.coverFan?.target(direction):null;
+  const expected=target?window.coverFan.expected(direction):{};
+  if(pending) delete expected.expectedRevision;
+  startSelection(target||pending?.track||server.track, '/api/player/'+direction,
+    {...expected,navigationId:navigationBurst.id,navigationOffset:navigationBurst.offset,anchorId:navigationBurst.anchorId}, direction,!!target);
 }
 
 function togglePlayback() {
@@ -150,8 +166,11 @@ async function refresh() {
     if (sequence !== selectionSequence || (server && status.revision < server.revision)) return;
     server = status;
     window.libraryUI?.sync(status.libraryRevision);
-    if (pending && status.latestRequestId === pending.requestId && status.pending)
-      pending.track = status.pending;
+    if (pending && status.latestRequestId === pending.requestId && status.pending) {
+      pending.track = status.pending; pending.exact=true;
+    }
+    if(pending && status.navigation?.requestId===pending.requestId && status.navigation.target)
+      {pending.track=status.navigation.target; pending.exact=true;}
     if (!pending && wantsAudio && server.ready && attachedRevision !== server.revision) {
       attachedRevision = server.revision;
       connect('revision=' + server.revision);
@@ -224,8 +243,8 @@ if(!window.coverFan) {
   $('#artwork').onerror=()=>$('#cover').classList.remove('has-art');
 }
 $('#stop').onclick=async()=>{
-  ++selectionSequence; controlRequest?.abort(); pending=null; wantsAudio=false; disconnect(); phase='idle'; render();
-  try { server=await api('/api/player/stop',{}); render(); } catch(error) { notice(error.message); }
+  const sequence=++selectionSequence; controlRequest?.abort(); pending=null; navigationBurst=null; wantsAudio=false; disconnect(); phase='idle'; render();
+  try { const status=await api('/api/player/stop',{clientId,commandSequence:sequence}); if(sequence===selectionSequence) {server=status; render();} } catch(error) { if(sequence===selectionSequence) notice(error.message); }
 };
 audio.onplaying=()=>{ reconnectAttempts=0; mediaControls.register(); phase='playing'; notice(); render(); };
 audio.addEventListener('loadedmetadata',()=>mediaControls.register());
