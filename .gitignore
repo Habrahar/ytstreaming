@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+artifacts/
+.local/
+.env
+*.user
+*.log
+cookies*.txt
+oauth*.json
+browser*.json
