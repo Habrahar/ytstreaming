@@ -21,6 +21,7 @@ PROXY = os.environ.get("YOUTUBE_PROXY", "").strip()
 PROXIES = {"http": PROXY, "https": PROXY} if PROXY else {}
 VIDEO_ID = re.compile(r"^[a-zA-Z0-9_-]{11}$")
 slots = threading.BoundedSemaphore(2)
+metadata_slots = threading.BoundedSemaphore(2)
 catalog_lock = threading.Lock()
 cache_lock = threading.Lock()
 audio_cache = OrderedDict()
@@ -91,8 +92,9 @@ def radio(video_id):
     return tracks
 
 
-def artwork(video_id, preview=False, thumbnail=None):
-    key = (video_id, preview)
+def artwork(video_id, preview=False, thumbnail=None, preview_size=96):
+    preview_size = 320 if preview_size == 320 else 96
+    key = (video_id, preview, preview_size if preview else 0)
     with cache_lock:
         cached = artwork_cache.get(key)
         if cached:
@@ -112,7 +114,7 @@ def artwork(video_id, preview=False, thumbnail=None):
     if not url.startswith('https://') or not (host == 'i.ytimg.com' or host.endswith('.googleusercontent.com')):
         raise ValueError('No supported artwork')
     if preview and host.endswith('.googleusercontent.com'):
-        url = re.sub(r'=w\d+-h\d+', '=w96-h96', url)
+        url = re.sub(r'=w\d+-h\d+', f'=w{preview_size}-h{preview_size}', url)
     with NetworkSession() as session:
         with session.get(url, stream=True, allow_redirects=False) as response:
             response.raise_for_status()
@@ -274,7 +276,8 @@ class Handler(BaseHTTPRequestHandler):
             if not artwork_slots.acquire(timeout=5):
                 return self.send_json(503, {'error':'Artwork busy'})
             try:
-                data, content_type = artwork(video_id, params.get('size',[''])[0] == 'small', params.get('thumbnail',[''])[0])
+                size = params.get('size',[''])[0]
+                data, content_type = artwork(video_id, size in ('small','card'), params.get('thumbnail',[''])[0], 320 if size == 'card' else 96)
                 self.send_response(200)
                 self.send_header('Content-Type', content_type)
                 self.send_header('Content-Length', str(len(data)))
@@ -285,7 +288,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception: self.send_json(502, {'error':'Artwork unavailable'})
             finally: artwork_slots.release()
             return
-        if not slots.acquire(blocking=False):
+        operation_slots = metadata_slots if url.path in ('/search','/radio') else slots
+        if not operation_slots.acquire(blocking=False):
             return self.send_json(503, {"error": "Источник занят. Повтори запрос чуть позже."})
         try:
             if url.path == "/search":
@@ -321,7 +325,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json(502, {"error": "YouTube недоступен с Raspberry Pi или не отдал аудио. Проверь подключение и прокси."})
         finally:
-            slots.release()
+            operation_slots.release()
 
 
 if __name__ == "__main__":

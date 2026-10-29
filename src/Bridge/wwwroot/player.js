@@ -26,13 +26,14 @@ function render() {
   $('#artist').textContent = isMusic ? track.artist : 'Начни с поиска наверху';
   $('#duration').textContent = isMusic ? track.duration || '' : '';
   const artworkUrl = isMusic ? '/api/artwork/' + encodeURIComponent(track.id.slice(8)) : null;
-  if (artworkTrack !== track?.id) {
+  if (window.coverFan) window.coverFan.sync(track,server,pending);
+  else if (artworkTrack !== track?.id) {
     artworkTrack = track?.id;
     $('#cover').classList.remove('has-art');
     if (artworkUrl) { $('#artwork').src=artworkUrl; $('#artwork').alt='Обложка: '+track.title; }
     else $('#artwork').removeAttribute('src');
   }
-  const status = pending ? (pending.direction ? 'Готовим '+(pending.direction==='next'?'следующую':'предыдущую')+' песню…' : 'Готовим выбранную песню…') : ({idle:'Выбери песню', buffering:'Подключаем звук…',
+  const status = pending ? (pending.direction ? 'Готовим '+(pending.direction==='next'?'следующую':'предыдущую')+' песню…' : 'Готовим выбранную песню…') : ({idle:isMusic?'Нажми ▶, чтобы слушать':'Выбери песню', buffering:'Подключаем звук…',
     playing:'Сейчас играет', paused:'На паузе', ended:'Трек закончился', gesture:'Нажми ▶, чтобы включить звук',
     error:'Не удалось воспроизвести'})[phase];
   $('#status').textContent = status;
@@ -103,7 +104,7 @@ function startSelection(track, path, body, direction = null) {
 function choose(track) { startSelection(track, '/api/player/play', {id:track.id}); }
 function navigate(direction) {
   if (!server?.track || pending) return;
-  startSelection(server.track, '/api/player/'+direction, {}, direction);
+  startSelection(window.coverFan?.target(direction)||server.track, '/api/player/'+direction, window.coverFan?.expected(direction)||{}, direction);
 }
 
 function togglePlayback() {
@@ -197,8 +198,10 @@ document.addEventListener('keydown', event => {
 $('#play').onclick=togglePlayback;
 $('#previous').onclick=()=>navigate('previous');
 $('#next').onclick=()=>navigate('next');
-$('#artwork').onload=()=>$('#cover').classList.add('has-art');
-$('#artwork').onerror=()=>$('#cover').classList.remove('has-art');
+if(!window.coverFan) {
+  $('#artwork').onload=()=>$('#cover').classList.add('has-art');
+  $('#artwork').onerror=()=>$('#cover').classList.remove('has-art');
+}
 $('#stop').onclick=async()=>{
   ++selectionSequence; controlRequest?.abort(); pending=null; wantsAudio=false; disconnect(); phase='idle'; render();
   try { server=await api('/api/player/stop',{}); render(); } catch(error) { notice(error.message); }

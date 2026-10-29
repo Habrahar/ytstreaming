@@ -38,6 +38,59 @@ try
 finally { await engine.StopPlaybackAsync(); }
 
 await NavigationChecks();
+await PreviewChecks();
+
+static async Task PreviewChecks()
+{
+    var source = new NavigationSource();
+    var player = new AudioEngine(source, new ConfigurationBuilder().Build(), NullLogger<AudioEngine>.Instance);
+    var related = new FakeRecommendations(source.Tracks) { Delay = true };
+    using var navigation = new PlaybackNavigator(player, source, related);
+    long Version() => System.Text.Json.JsonSerializer.SerializeToElement(navigation.Status).GetProperty("version").GetInt64();
+    void Assert(bool value, string message) { if (!value) throw new Exception(message); }
+    try
+    {
+        await navigation.PlayAsync(source.Tracks[0], "preview-a");
+        var revision = player.Revision;
+        using var abandoned = new CancellationTokenSource();
+        var first = navigation.PreviewAsync(revision, Version(), abandoned.Token);
+        await related.Entered.Task;
+        var second = navigation.PreviewAsync(revision, Version());
+        abandoned.Cancel();
+        try { await first; throw new Exception("Abandoned preview was not cancelled"); } catch (OperationCanceledException) { }
+        related.Release.SetResult();
+        var preview = await second;
+        Assert(related.Calls == 1 && preview.Previous.Length == 0 && preview.Next[0].Id == source.Tracks[1].Id,
+            "Preview was not shared, or it changed the proposed next song");
+        Assert(player.Revision == revision && player.Current == source.Tracks[0], "Preview changed playback");
+        Assert(navigation.Find(preview.Next[1].Id) is not null, "Preview artwork track is unknown");
+        await navigation.NextAsync("preview-b", expectedId: preview.Next[0].Id, expectedRevision: revision);
+        preview = await navigation.PreviewAsync(player.Revision, Version());
+        Assert(preview.Previous[0].Id == source.Tracks[0].Id && preview.Next[0].Id == source.Tracks[2].Id && related.Calls == 1,
+            "The second preview changed after moving the first to centre");
+        await navigation.PreviousAsync("preview-back");
+        preview = await navigation.PreviewAsync(player.Revision, Version());
+        Assert(preview.Next.Select(t => t.Id).SequenceEqual(source.Tracks.Skip(1).Take(2).Select(t => t.Id)),
+            "Forward history and recommendations are not in display order");
+        try { await navigation.NextAsync("stale", expectedRevision: revision); throw new Exception("Stale click accepted"); }
+        catch (SelectionSupersededException) { }
+        try { await navigation.NextAsync("wrong-card", expectedId: source.Tracks[2].Id); throw new Exception("Wrong cover accepted"); }
+        catch (SelectionSupersededException) { }
+        Assert(player.Current == source.Tracks[0], "A stale cover switched to a different song");
+
+        await navigation.PlayAsync(source.Tracks[1], "reset-preview");
+        related.Entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        related.Release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        var late = navigation.PreviewAsync(player.Revision, Version());
+        await related.Entered.Task;
+        await navigation.PlayAsync(source.Tracks[0], "manual-after-preview");
+        related.Release.SetResult();
+        try { await late; throw new Exception("Old preview published after manual selection"); } catch (SelectionSupersededException) { }
+        Assert(player.Current == source.Tracks[0], "Late preview changed the selected song");
+        Console.WriteLine("PASS: shared read-only previews, exact next cover, forward queue, stale clicks and cancelled old previews");
+    }
+    finally { await navigation.StopAsync(); }
+}
 
 static async Task NavigationChecks()
 {
@@ -61,6 +114,7 @@ static async Task NavigationChecks()
         Assert(status.GetProperty("count").GetInt32() == 2 && status.GetProperty("position").GetInt32() == 1,
             "Failed Next modified history");
         source.FailThird = false;
+        await navigation.PlayAsync(source.Tracks[1], "reset-cached-radio");
         related.Delay = true;
         var late = navigation.NextAsync("late-radio");
         await related.Entered.Task;

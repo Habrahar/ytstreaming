@@ -30,6 +30,22 @@ class Handler:
 
 
 class ResumeCheck(unittest.TestCase):
+    def test_carousel_card_has_separate_cache_and_does_not_fetch_radio(self):
+        urls=[]
+        class Session:
+            def __enter__(self): return self
+            def __exit__(self,*_): pass
+            def get(self,url,**kwargs):
+                urls.append(url)
+                return Response(200,[b'image'],{'Content-Type':'image/jpeg'})
+        with patch.dict(server.track_cache,{},clear=True), patch.dict(server.artwork_cache,{},clear=True), \
+             patch.object(server,'NetworkSession',Session), patch.object(server,'radio') as radio:
+            url='https://yt3.googleusercontent.com/card=w544-h544-l90-rj'
+            server.artwork('AAAAAAAAAAA',True,url,320)
+            server.artwork('AAAAAAAAAAA',True,url,96)
+            self.assertIn('=w320-h320',urls[0]); self.assertIn('=w96-h96',urls[1])
+            self.assertEqual(len(server.artwork_cache),2); radio.assert_not_called()
+
     def test_saved_preview_uses_validated_thumbnail_after_catalog_reset(self):
         urls=[]
         class Session:

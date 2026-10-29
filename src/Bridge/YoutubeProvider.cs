@@ -63,12 +63,12 @@ public sealed class YoutubeProvider(IConfiguration config) : ITrackRecommendatio
         catch { throw new ProviderException("Не удалось загрузить следующие песни."); }
     }
 
-    public async Task<(byte[] Bytes, string ContentType)> ArtworkAsync(Track track, CancellationToken cancellationToken, bool preview = false)
+    public async Task<(byte[] Bytes, string ContentType)> ArtworkAsync(Track track, CancellationToken cancellationToken, int previewSize = 0)
     {
         // A saved track can outlive the provider's in-memory search catalog.
         // The internal adapter validates this fallback against its image allowlist.
         var thumbnail = string.IsNullOrEmpty(track.Thumbnail) ? "" : "&thumbnail=" + Uri.EscapeDataString(track.Thumbnail);
-        using var response = await client.GetAsync(BaseUrl + "/artwork?id=" + Uri.EscapeDataString(track.Id[8..]) + (preview ? "&size=small" : "") + thumbnail, cancellationToken);
+        using var response = await client.GetAsync(BaseUrl + "/artwork?id=" + Uri.EscapeDataString(track.Id[8..]) + (previewSize == 320 ? "&size=card" : previewSize == 96 ? "&size=small" : "") + thumbnail, cancellationToken);
         if (!response.IsSuccessStatusCode) throw new ProviderException("Обложка недоступна.");
         var contentType = response.Content.Headers.ContentType?.MediaType;
         if (contentType is not ("image/jpeg" or "image/png" or "image/webp"))

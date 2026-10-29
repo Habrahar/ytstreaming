@@ -74,6 +74,8 @@ app.MapGet("/health/live", (AudioEngine engine) => Results.Json(
 app.MapGet("/listen.m3u", (HttpRequest request) => Results.Text(
     $"#EXTM3U\n#EXTINF:-1,ytstreaming\n{request.Scheme}://{request.Host}/stream.mp3\n", "audio/x-mpegurl"));
 app.MapGet("/api/status", (AudioEngine engine, PlaybackNavigator navigator) => Results.Json(PlayerStatus(engine, navigator)));
+app.MapGet("/api/player/neighbors", (long revision, long version, PlaybackNavigator navigator, HttpContext context) =>
+    navigator.PreviewAsync(revision, version, context.RequestAborted));
 app.MapGet("/api/tracks", (string? q, IMusicProvider provider) => provider.Search(q));
 app.MapGet("/api/youtube/search", (string q, YoutubeProvider youtube, HttpContext context) => youtube.SearchAsync(q, context.RequestAborted));
 Track? FindTrack(string? id, MusicCatalog catalog, PlaybackNavigator navigator, AudioEngine engine, MusicLibrary library) =>
@@ -99,7 +101,8 @@ app.MapGet("/api/artwork/{videoId}", async (string videoId, MusicCatalog catalog
     var id = "youtube:" + videoId;
     var track = FindTrack(id, catalog, navigator, engine, library);
     if (track is null) return Results.NotFound();
-    var artwork = await youtube.ArtworkAsync(track, context.RequestAborted, context.Request.Query["size"] == "small");
+    var size = context.Request.Query["size"].ToString();
+    var artwork = await youtube.ArtworkAsync(track, context.RequestAborted, size == "card" ? 320 : size == "small" ? 96 : 0);
     context.Response.Headers.CacheControl = "private, max-age=3600";
     return Results.File(artwork.Bytes, artwork.ContentType);
 });
@@ -113,14 +116,14 @@ app.MapPost("/api/player/play", async (PlayRequest request, AudioEngine engine, 
 });
 app.MapPost("/api/player/next", async (NavigationRequest request, AudioEngine engine, PlaybackNavigator navigator, HttpContext context) =>
 {
-    if (request.RequestId?.Length > 64) return Results.BadRequest();
-    await navigator.NextAsync(request.RequestId, context.RequestAborted);
+    if (request.RequestId?.Length > 64 || request.ExpectedId?.Length > 64) return Results.BadRequest();
+    await navigator.NextAsync(request.RequestId, context.RequestAborted, request.ExpectedId, request.ExpectedRevision);
     return Results.Ok(PlayerStatus(engine, navigator));
 });
 app.MapPost("/api/player/previous", async (NavigationRequest request, AudioEngine engine, PlaybackNavigator navigator, HttpContext context) =>
 {
-    if (request.RequestId?.Length > 64) return Results.BadRequest();
-    await navigator.PreviousAsync(request.RequestId, context.RequestAborted);
+    if (request.RequestId?.Length > 64 || request.ExpectedId?.Length > 64) return Results.BadRequest();
+    await navigator.PreviousAsync(request.RequestId, context.RequestAborted, request.ExpectedId, request.ExpectedRevision);
     return Results.Ok(PlayerStatus(engine, navigator));
 });
 app.MapPost("/api/player/stop", async (AudioEngine engine, PlaybackNavigator navigator) =>
@@ -178,7 +181,7 @@ app.MapGet("/stream.mp3", async (HttpContext context, AudioEngine engine) =>
 app.Run();
 
 record PlayRequest(string Id, string? RequestId = null);
-record NavigationRequest(string? RequestId = null);
+record NavigationRequest(string? RequestId = null, string? ExpectedId = null, long? ExpectedRevision = null);
 record LikeRequest(string Id, bool Liked);
 record PlaylistRequest(string? Name);
 record MembershipRequest(string Id, bool Added);
