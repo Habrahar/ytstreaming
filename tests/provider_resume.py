@@ -30,6 +30,21 @@ class Handler:
 
 
 class ResumeCheck(unittest.TestCase):
+    def test_radio_metadata_uses_largest_artwork_and_deduplicates(self):
+        tracks = server.normalize_tracks([{'videoId':'AAAAAAAAAAA','title':'Song','artists':None,
+            'length':'3:10','thumbnail':[{'url':'https://i.ytimg.com/small.jpg','width':120},
+                                      {'url':'https://i.ytimg.com/large.jpg','width':544}]},
+            {'videoId':'AAAAAAAAAAA','title':'Duplicate'}, {'videoId':'invalid'}])
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]['thumbnail'], 'https://i.ytimg.com/large.jpg')
+        self.assertEqual(tracks[0]['duration'], '3:10')
+
+    def test_artwork_rejects_unknown_hosts_without_fetching(self):
+        with patch.dict(server.track_cache, {'AAAAAAAAAAA':{'thumbnail':'https://127.0.0.1/private'}}, clear=True), \
+             patch.object(server, 'radio', return_value=[]), patch.object(server, 'NetworkSession') as network:
+            with self.assertRaises(ValueError): server.artwork('AAAAAAAAAAA')
+            network.assert_not_called()
+
     def run_case(self, resume):
         responses = iter([Response(200, [b'abc', requests.ConnectionError('drop')], {'Content-Length':'6'}), resume])
         ranges = []

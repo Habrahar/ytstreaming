@@ -24,6 +24,10 @@ slots = threading.BoundedSemaphore(2)
 catalog_lock = threading.Lock()
 cache_lock = threading.Lock()
 audio_cache = OrderedDict()
+track_cache = OrderedDict()
+radio_cache = OrderedDict()
+artwork_cache = OrderedDict()
+artwork_slots = threading.BoundedSemaphore(2)
 
 
 class NetworkSession(requests.Session):
@@ -42,15 +46,86 @@ class NetworkSession(requests.Session):
 catalog = YTMusic(requests_session=NetworkSession(), proxies=PROXIES, language="en")
 
 
+def normalize_tracks(items):
+    tracks = []
+    seen = set()
+    for item in items:
+        video_id = item.get('videoId', '')
+        if not VIDEO_ID.fullmatch(video_id) or video_id in seen:
+            continue
+        seen.add(video_id)
+        thumbnails = item.get('thumbnails') or item.get('thumbnail') or []
+        thumbnails = sorted(thumbnails, key=lambda t: t.get('width', 0), reverse=True)
+        tracks.append({'id':'youtube:' + video_id, 'title':item.get('title') or 'Без названия',
+                       'artist':', '.join(a.get('name') or '' for a in (item.get('artists') or [])),
+                       'provider':'youtube', 'duration':item.get('duration') or item.get('length'),
+                       'thumbnail':next((t['url'] for t in thumbnails if t.get('url','').startswith('https://')), None)})
+    with cache_lock:
+        for track in tracks:
+            track_cache[track['id'][8:]] = track
+            track_cache.move_to_end(track['id'][8:])
+        while len(track_cache) > 200:
+            track_cache.popitem(last=False)
+    return tracks
+
+
 def search(query):
     with catalog_lock:
-        found = catalog.search(query, filter="songs", limit=12)
-    return [{"id": "youtube:" + item["videoId"], "title": item.get("title", "Без названия"),
-             "artist": ", ".join(a.get("name", "") for a in item.get("artists", [])),
-             "provider": "youtube", "duration": item.get("duration"),
-             "thumbnail": next((t["url"] for t in reversed(item.get("thumbnails", []))
-                                if t.get("url", "").startswith("https://")), None)}
-            for item in found[:12] if VIDEO_ID.fullmatch(item.get("videoId", ""))]
+        found = catalog.search(query, filter='songs', limit=12)
+    return normalize_tracks(found[:12])
+
+
+def radio(video_id):
+    with cache_lock:
+        cached = radio_cache.get(video_id)
+        if cached and time.monotonic() - cached[0] < 300:
+            return cached[1]
+    with catalog_lock:
+        playlist = catalog.get_watch_playlist(videoId=video_id, radio=True, limit=12)
+    tracks = normalize_tracks(playlist.get('tracks', [])[:16])
+    with cache_lock:
+        radio_cache[video_id] = (time.monotonic(), tracks)
+        radio_cache.move_to_end(video_id)
+        while len(radio_cache) > 16:
+            radio_cache.popitem(last=False)
+    return tracks
+
+
+def artwork(video_id):
+    with cache_lock:
+        cached = artwork_cache.get(video_id)
+        if cached:
+            artwork_cache.move_to_end(video_id)
+            return cached
+    # Watch metadata includes the album art at up to 544px, unlike the 120px
+    # preview returned by search. Reuse this request later for the Next button.
+    try: radio(video_id)
+    except Exception: pass
+    with cache_lock:
+        track = track_cache.get(video_id)
+    url = (track or {}).get('thumbnail') or ''
+    host = urlparse(url).hostname or ''
+    if not url.startswith('https://') or not (host == 'i.ytimg.com' or host.endswith('.googleusercontent.com')):
+        raise ValueError('No supported artwork')
+    with NetworkSession() as session:
+        with session.get(url, stream=True, allow_redirects=False) as response:
+            response.raise_for_status()
+            content_type = response.headers.get('Content-Type','').split(';')[0].lower()
+            if content_type not in ('image/jpeg', 'image/png', 'image/webp'):
+                raise ValueError('Unsupported image')
+            chunks, size = [], 0
+            for chunk in response.iter_content(16384):
+                size += len(chunk)
+                if size > 2 * 1024 * 1024:
+                    raise ValueError('Artwork is too large')
+                chunks.append(chunk)
+    result = (b''.join(chunks), content_type)
+    if not result[0]: raise ValueError('Empty artwork')
+    with cache_lock:
+        artwork_cache[video_id] = result
+        while sum(len(item[0]) for item in artwork_cache.values()) > 8 * 1024 * 1024:
+            artwork_cache.popitem(last=False)
+    return result
 
 
 class ResolveCancelled(Exception): pass
@@ -188,6 +263,25 @@ class Handler(BaseHTTPRequestHandler):
         params = parse_qs(url.query)
         if url.path == "/healthz":
             return self.send_json(200, {"ready": True, "proxyConfigured": bool(PROXY)})
+        if url.path == '/artwork':
+            video_id = params.get('id', [''])[0]
+            if not VIDEO_ID.fullmatch(video_id):
+                return self.send_json(400, {'error':'Invalid track'})
+            # Artwork cannot occupy the two audio/extraction slots.
+            if not artwork_slots.acquire(timeout=5):
+                return self.send_json(503, {'error':'Artwork busy'})
+            try:
+                data, content_type = artwork(video_id)
+                self.send_response(200)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(len(data)))
+                self.send_header('Cache-Control', 'private, max-age=3600')
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError): pass
+            except Exception: self.send_json(502, {'error':'Artwork unavailable'})
+            finally: artwork_slots.release()
+            return
         if not slots.acquire(blocking=False):
             return self.send_json(503, {"error": "Источник занят. Повтори запрос чуть позже."})
         try:
@@ -202,6 +296,8 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/resolve":
                 resolve(video_id, self.disconnected)
                 return self.send_json(200, {"ready": True})
+            if url.path == '/radio':
+                return self.send_json(200, radio(video_id))
             if url.path == "/audio":
                 with cache_lock:
                     cached = audio_cache.get(video_id)

@@ -4,7 +4,12 @@ namespace Bridge;
 
 public sealed class ProviderException(string message) : Exception(message);
 
-public sealed class YoutubeProvider(IConfiguration config)
+public interface ITrackRecommendations
+{
+    Task<Track[]> RelatedAsync(Track track, CancellationToken cancellationToken = default);
+}
+
+public sealed class YoutubeProvider(IConfiguration config) : ITrackRecommendations
 {
     private readonly HttpClient client = new() { Timeout = TimeSpan.FromSeconds(75) };
     private readonly object cacheLock = new();
@@ -13,6 +18,16 @@ public sealed class YoutubeProvider(IConfiguration config)
     public bool Enabled => !string.IsNullOrEmpty(BaseUrl);
 
     public Track? Find(string id) { lock (cacheLock) return known.GetValueOrDefault(id); }
+
+    private void Remember(Track[] tracks)
+    {
+        lock (cacheLock)
+            foreach (var track in tracks)
+            {
+                if (known.Count >= 200) known.Remove(known.Keys.First());
+                known[track.Id] = track;
+            }
+    }
 
     public async Task<Track[]> SearchAsync(string query, CancellationToken cancellationToken)
     {
@@ -24,19 +39,40 @@ public sealed class YoutubeProvider(IConfiguration config)
             using var response = await client.GetAsync(BaseUrl + "/search?q=" + Uri.EscapeDataString(query.Trim()), cancellationToken);
             if (!response.IsSuccessStatusCode) throw new ProviderException("YouTube Music недоступен с Raspberry Pi. Проверь подключение или прокси.");
             var tracks = await response.Content.ReadFromJsonAsync<Track[]>(cancellationToken) ?? [];
-            lock (cacheLock)
-            {
-                foreach (var track in tracks)
-                {
-                    if (known.Count >= 200) known.Remove(known.Keys.First());
-                    known[track.Id] = track;
-                }
-            }
+            Remember(tracks);
             return tracks;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (ProviderException) { throw; }
         catch { throw new ProviderException("Источник YouTube не ответил. Текущий эфир продолжает играть."); }
+    }
+
+    public async Task<Track[]> RelatedAsync(Track track, CancellationToken cancellationToken = default)
+    {
+        if (!Enabled || !track.Id.StartsWith("youtube:", StringComparison.Ordinal)) return [];
+        try
+        {
+            using var response = await client.GetAsync(BaseUrl + "/radio?id=" + Uri.EscapeDataString(track.Id[8..]), cancellationToken);
+            if (!response.IsSuccessStatusCode) throw new ProviderException("YouTube не вернул следующую песню. Попробуй ещё раз.");
+            var tracks = await response.Content.ReadFromJsonAsync<Track[]>(cancellationToken) ?? [];
+            Remember(tracks);
+            return tracks;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (ProviderException) { throw; }
+        catch { throw new ProviderException("Не удалось загрузить следующие песни."); }
+    }
+
+    public async Task<(byte[] Bytes, string ContentType)> ArtworkAsync(Track track, CancellationToken cancellationToken)
+    {
+        using var response = await client.GetAsync(BaseUrl + "/artwork?id=" + Uri.EscapeDataString(track.Id[8..]), cancellationToken);
+        if (!response.IsSuccessStatusCode) throw new ProviderException("Обложка недоступна.");
+        var contentType = response.Content.Headers.ContentType?.MediaType;
+        if (contentType is not ("image/jpeg" or "image/png" or "image/webp"))
+            throw new ProviderException("Обложка недоступна.");
+        var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+        if (bytes.Length is 0 or > 2097152) throw new ProviderException("Обложка недоступна.");
+        return (bytes, contentType);
     }
 
     public async Task<AudioSource> ResolveAudioAsync(Track track, CancellationToken cancellationToken = default)
