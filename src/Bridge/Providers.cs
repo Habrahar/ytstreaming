@@ -7,7 +7,7 @@ public record AudioSource(string Location, bool Loop);
 public interface IMusicProvider
 {
     Track[] Search(string? query);
-    Task<AudioSource> ResolveAudioAsync(Track track);
+    Task<AudioSource> ResolveAudioAsync(Track track, CancellationToken cancellationToken = default);
 }
 
 public sealed class TestProvider : IMusicProvider
@@ -51,13 +51,13 @@ public sealed class TestProvider : IMusicProvider
         return path;
     }
 
-    public Task<AudioSource> ResolveAudioAsync(Track track) => Task.FromResult(new AudioSource(ResolveAudio(track), true));
+    public Task<AudioSource> ResolveAudioAsync(Track track, CancellationToken cancellationToken = default) => Task.FromResult(new AudioSource(ResolveAudio(track), true));
 }
 
 public sealed class MusicCatalog(TestProvider test, YoutubeProvider youtube) : IMusicProvider
 {
     public Track[] Search(string? query) => test.Search(query);
     public Track? Find(string id) => test.Search(null).FirstOrDefault(t => t.Id == id) ?? youtube.Find(id);
-    public Task<AudioSource> ResolveAudioAsync(Track track) => track.Provider == "youtube"
-        ? youtube.ResolveAudioAsync(track) : test.ResolveAudioAsync(track);
+    public Task<AudioSource> ResolveAudioAsync(Track track, CancellationToken cancellationToken = default) => track.Provider == "youtube"
+        ? youtube.ResolveAudioAsync(track, cancellationToken) : test.ResolveAudioAsync(track, cancellationToken);
 }

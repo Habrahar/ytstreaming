@@ -39,18 +39,30 @@ public sealed class YoutubeProvider(IConfiguration config)
         catch { throw new ProviderException("Источник YouTube не ответил. Текущий эфир продолжает играть."); }
     }
 
-    public async Task<AudioSource> ResolveAudioAsync(Track track)
+    public async Task<AudioSource> ResolveAudioAsync(Track track, CancellationToken cancellationToken = default)
     {
         if (!Enabled || !track.Id.StartsWith("youtube:", StringComparison.Ordinal))
             throw new ProviderException("Неизвестный источник.");
         var id = Uri.EscapeDataString(track.Id[8..]);
         try
         {
-            using var response = await client.GetAsync(BaseUrl + "/resolve?id=" + id);
-            if (!response.IsSuccessStatusCode)
-                throw new ProviderException("YouTube не отдал аудио этого трека. Эфир сохранён; попробуй другую запись или проверь подключение.");
-            return new AudioSource(BaseUrl + "/audio?id=" + id, false);
+            // A superseded Python extraction may still be unwinding. Retry only busy,
+            // not arbitrary upstream failures, and always honour the latest selection.
+            for (var attempt = 0; attempt < 40; attempt++)
+            {
+                using var response = await client.GetAsync(BaseUrl + "/resolve?id=" + id, cancellationToken);
+                if (response.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable && attempt < 39)
+                {
+                    await Task.Delay(300, cancellationToken);
+                    continue;
+                }
+                if (!response.IsSuccessStatusCode)
+                    throw new ProviderException("Не удалось получить эту запись YouTube. Попробуй другую версию трека.");
+                return new AudioSource(BaseUrl + "/audio?id=" + id, false);
+            }
+            throw new ProviderException("Источник занят. Попробуй ещё раз.");
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (ProviderException) { throw; }
         catch { throw new ProviderException("Не удалось подготовить трек YouTube. Текущий эфир сохранён."); }
     }

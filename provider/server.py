@@ -2,8 +2,14 @@
 import json
 import os
 import re
+import select
+import signal
+import socket
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -47,28 +53,54 @@ def search(query):
             for item in found[:12] if VIDEO_ID.fullmatch(item.get("videoId", ""))]
 
 
-class QuietLogger:
-    def debug(self, *_): pass
-    def warning(self, *_): pass
-    def error(self, *_): pass
+class ResolveCancelled(Exception): pass
 
 
-def resolve(video_id):
-    import yt_dlp
-    options = {"format": "bestaudio[ext=m4a]/bestaudio", "quiet": True,
-               "no_warnings": True, "logger": QuietLogger(), "noplaylist": True,
-               "cachedir": False, "socket_timeout": 15, "retries": 1,
-               "extractor_retries": 1, "js_runtimes": {"node": {}},
-               "proxy": PROXY or ""}
-    with yt_dlp.YoutubeDL(options) as downloader:
-        info = downloader.extract_info("https://www.youtube.com/watch?v=" + video_id, download=False)
-    if info.get("is_live") or info.get("has_drm"):
+EXTRACTOR_PATH = Path(__file__).with_name('extract.py')
+
+
+def extract_source(video_id, cancelled=None):
+    process = subprocess.Popen([sys.executable, str(EXTRACTOR_PATH), video_id],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    deadline = time.monotonic() + 65
+    try:
+        while True:
+            if cancelled and cancelled():
+                raise ResolveCancelled()
+            if time.monotonic() > deadline:
+                raise TimeoutError('Source preparation timed out')
+            try:
+                output, _ = process.communicate(timeout=.1)
+                if process.returncode:
+                    raise ValueError('Source unavailable')
+                return json.loads(output)
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        if process.poll() is None:
+            # Kill the whole process group, including Node. The next selection
+            # must not wait behind work that its listener has already abandoned.
+            os.killpg(process.pid, signal.SIGTERM)
+            try: process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+
+
+def resolve(video_id, cancelled=None):
+    with cache_lock:
+        cached = audio_cache.get(video_id)
+        if cached is not None and time.monotonic() - cached[0] < 1200:
+            audio_cache.move_to_end(video_id)
+            return
+    info = extract_source(video_id, cancelled)
+    if info.get("unsupported"):
         raise ValueError("Unsupported source")
     source = info.get("url", "")
     host = urlparse(source).hostname or ""
     if not source.startswith("https://") or not host.endswith(".googlevideo.com"):
         raise ValueError("Unexpected media host")
-    headers = info.get("http_headers", {})
+    headers = info.get("headers", {})
     # Resolve before switching the shared player; inaccessible audio leaves it running.
     with NetworkSession() as session:
         with session.get(source, headers={**headers, "Range": "bytes=0-4095"}, stream=True) as response:
@@ -82,12 +114,65 @@ def resolve(video_id):
             audio_cache.popitem(last=False)
 
 
+def forward_audio(handler, source, headers):
+    """Resume interrupted upstream downloads without repeating already sent bytes."""
+    requested = handler.headers.get("Range", "")
+    if requested and not re.fullmatch(r"bytes=\d+-\d*", requested):
+        requested = ""
+    position = int(requested[6:].split("-")[0]) if requested else 0
+    end = requested.split("-", 1)[1] if requested else ""
+    started = False
+    remaining = None
+    for attempt in range(4):
+        upstream_headers = dict(headers)
+        if requested or started:
+            upstream_headers["Range"] = f"bytes={position}-{end}"
+        try:
+            with NetworkSession() as session:
+                with session.get(source, headers=upstream_headers, stream=True) as response:
+                    response.raise_for_status()
+                    if started:
+                        content_range = response.headers.get("Content-Range", "")
+                        if response.status_code != 206 or not content_range.startswith(f"bytes {position}-"):
+                            raise ValueError("Upstream ignored resume range")
+                    else:
+                        if response.status_code == 200:
+                            position = 0
+                        handler.send_response(response.status_code)
+                        for header in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+                            if header in response.headers:
+                                handler.send_header(header, response.headers[header])
+                        handler.send_header("Connection", "close")
+                        handler.end_headers()
+                        handler.close_connection = True
+                        remaining = int(response.headers["Content-Length"]) if "Content-Length" in response.headers else None
+                        started = True
+                    for chunk in response.iter_content(4096):
+                        if not chunk:
+                            continue
+                        handler.wfile.write(chunk)
+                        position += len(chunk)
+                        if remaining is not None:
+                            remaining -= len(chunk)
+                    if remaining is None or remaining <= 0:
+                        return
+                    raise requests.ConnectionError("Truncated audio")
+        except requests.RequestException:
+            if attempt == 3:
+                raise
+            time.sleep(.3 * (attempt + 1))
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_):
         # Do not log signed media URLs, proxy credentials or search history.
         pass
+
+    def disconnected(self):
+        readable, _, _ = select.select([self.connection], [], [], 0)
+        return bool(readable) and self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b''
 
     def send_json(self, code, value):
         data = json.dumps(value, ensure_ascii=False).encode()
@@ -115,7 +200,7 @@ class Handler(BaseHTTPRequestHandler):
             if not VIDEO_ID.fullmatch(video_id):
                 return self.send_json(400, {"error": "Некорректный идентификатор трека."})
             if url.path == "/resolve":
-                resolve(video_id)
+                resolve(video_id, self.disconnected)
                 return self.send_json(200, {"ready": True})
             if url.path == "/audio":
                 with cache_lock:
@@ -123,28 +208,16 @@ class Handler(BaseHTTPRequestHandler):
                 if cached is None or time.monotonic() - cached[0] > 1800:
                     return self.send_json(410, {"error": "Открой трек заново."})
                 _, source, headers = cached
-                requested_range = self.headers.get("Range", "")
-                if requested_range and re.fullmatch(r"bytes=\d+-\d*", requested_range):
-                    headers = {**headers, "Range": requested_range}
-                with NetworkSession() as session:
-                    with session.get(source, headers=headers, stream=True) as response:
-                        response.raise_for_status()
-                        self.send_response(response.status_code)
-                        for header in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
-                            if header in response.headers:
-                                self.send_header(header, response.headers[header])
-                        self.send_header("Connection", "close")
-                        self.end_headers()
-                        self.close_connection = True
-                        for chunk in response.iter_content(16384):
-                            self.wfile.write(chunk)
+                forward_audio(self, source, headers)
                 return
             return self.send_json(404, {"error": "Unknown endpoint"})
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ResolveCancelled):
             pass
         except Exception:
             # Return a safe, actionable error rather than upstream URLs or cookies.
             if url.path == "/audio":
+                with cache_lock:
+                    audio_cache.pop(video_id, None)
                 self.close_connection = True
             else:
                 self.send_json(502, {"error": "YouTube недоступен с Raspberry Pi или не отдал аудио. Проверь подключение и прокси."})

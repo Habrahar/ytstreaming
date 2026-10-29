@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 && r
 WORKDIR /provider
 COPY provider/requirements.txt .
 RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
-COPY provider/server.py .
+COPY provider/server.py provider/extract.py ./
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 USER 1654
 EXPOSE 8081

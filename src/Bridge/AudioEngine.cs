@@ -3,10 +3,24 @@ using System.Threading.Channels;
 
 namespace Bridge;
 
+public sealed class SelectionSupersededException : Exception { }
+
 public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, ILogger<AudioEngine> log)
     : IHostedService
 {
     private readonly SemaphoreSlim control = new(1, 1);
+    private readonly object selectionLock = new();
+    private CancellationTokenSource? selection;
+    private long selectionVersion;
+    private long revision;
+    private Track? pending;
+    private string? latestRequestId;
+    private string? activeRequestId;
+    private string? failedRequestId;
+    private string? lastError;
+    private long resolveMilliseconds;
+    private long startedAtTicks;
+    private long startupMilliseconds;
     private readonly object listenersLock = new();
     private readonly Dictionary<Guid, Channel<byte[]>> listeners = new();
     private Process? process;
@@ -17,13 +31,19 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     private volatile string state = "stopped";
     public Track? Current { get; private set; }
     public string State => state;
+    public long Revision => Interlocked.Read(ref revision);
+    public string? ActiveRequestId => activeRequestId;
+    public string? LatestRequestId => latestRequestId;
+    public string? FailedRequestId => failedRequestId;
     public bool Ready => state == "playing" &&
         DateTime.UtcNow.Ticks - Interlocked.Read(ref lastDataTicks) < TimeSpan.FromSeconds(5).Ticks;
     public object Status
     {
         get
         {
-            lock (listenersLock) return new { state, ready = Ready, track = Current,
+            lock (listenersLock) return new { state, ready = Ready, track = Current, pending,
+                revision = Revision, requestId = activeRequestId, latestRequestId, error = lastError,
+                resolveMilliseconds, startupMilliseconds,
                 listeners = listeners.Count, bytesSentToHub = Interlocked.Read(ref bytes),
                 stream = "/stream.mp3", provider = Current?.Provider,
                 youtubeMusic = string.IsNullOrEmpty(config["YOUTUBE_PROVIDER_URL"]) ? "not-configured" : "enabled" };
@@ -36,16 +56,43 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     }
     public async Task StopAsync(CancellationToken cancellationToken) => await StopPlaybackAsync();
 
-    public async Task PlayAsync(Track track)
+    public async Task PlayAsync(Track track, string? requestId = null, CancellationToken cancellationToken = default)
     {
-        await control.WaitAsync();
+        CancellationTokenSource ownSelection;
+        long version;
+        lock (selectionLock)
+        {
+            selection?.Cancel();
+            ownSelection = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            selection = ownSelection;
+            version = ++selectionVersion;
+            latestRequestId = requestId ?? Guid.NewGuid().ToString("N");
+            requestId = latestRequestId;
+            pending = track;
+            lastError = null;
+            failedRequestId = null;
+        }
+        var token = ownSelection.Token;
+        var watch = Stopwatch.StartNew();
+        var entered = false;
         try
         {
             // Prepare/validate remote audio while the previous shared stream keeps playing.
-            var source = await provider.ResolveAudioAsync(track);
-            await StopCoreAsync(false);
+            var source = await provider.ResolveAudioAsync(track, token);
+            token.ThrowIfCancellationRequested();
+            await control.WaitAsync(token);
+            entered = true;
+            token.ThrowIfCancellationRequested();
+            // Never mix tracks in an existing MP3 response: browsers retain old audio.
+            await StopCoreAsync(true);
+            token.ThrowIfCancellationRequested();
             state = "starting";
             Current = track;
+            activeRequestId = requestId;
+            Interlocked.Increment(ref revision);
+            resolveMilliseconds = watch.ElapsedMilliseconds;
+            startupMilliseconds = 0;
+            startedAtTicks = Stopwatch.GetTimestamp();
             var info = new ProcessStartInfo(config["FFMPEG_PATH"] ?? "ffmpeg")
             {
                 RedirectStandardOutput = true, RedirectStandardError = true,
@@ -53,7 +100,7 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
             };
             List<string> arguments = ["-hide_banner", "-loglevel", "warning", "-nostdin", "-re"];
             if (source.Loop) arguments.AddRange(["-stream_loop", "-1"]);
-            else arguments.AddRange(["-rw_timeout", "20000000"]);
+            else arguments.AddRange(["-rw_timeout", "20000000", "-probesize", "65536", "-analyzeduration", "1000000"]);
             arguments.AddRange(["-i", source.Location, "-vn", "-threads", "1",
                 "-c:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "2",
                 "-write_xing", "0", "-id3v2_version", "0", "-flush_packets", "1", "-f", "mp3", "pipe:1"]);
@@ -64,14 +111,32 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
             Interlocked.Exchange(ref lastDataTicks, 0);
             pump = PumpAsync(process, playback.Token);
         }
-        catch (ProviderException) { throw; }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            throw new SelectionSupersededException();
+        }
+        catch (ProviderException ex)
+        {
+            lock (selectionLock)
+                if (version == selectionVersion) { lastError = ex.Message; failedRequestId = requestId; }
+            throw;
+        }
         catch
         {
+            if (token.IsCancellationRequested) throw new SelectionSupersededException();
             state = "error";
             CompleteListeners();
             throw;
         }
-        finally { control.Release(); }
+        finally
+        {
+            if (entered) control.Release();
+            lock (selectionLock)
+            {
+                if (ReferenceEquals(selection, ownSelection)) { selection = null; pending = null; }
+                ownSelection.Dispose();
+            }
+        }
     }
 
     private async Task PumpAsync(Process encoder, CancellationToken token)
@@ -85,6 +150,8 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
                 var count = await encoder.StandardOutput.BaseStream.ReadAsync(buffer, token);
                 if (count == 0) break;
                 var chunk = buffer.AsSpan(0, count).ToArray();
+                if (Interlocked.Read(ref bytes) == 0)
+                    startupMilliseconds = (long)Stopwatch.GetElapsedTime(startedAtTicks).TotalMilliseconds;
                 Interlocked.Add(ref bytes, count);
                 Interlocked.Exchange(ref lastDataTicks, DateTime.UtcNow.Ticks);
                 state = "playing";
@@ -129,11 +196,11 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
     }
 
-    public (Guid Id, ChannelReader<byte[]> Reader)? Subscribe()
+    public (Guid Id, ChannelReader<byte[]> Reader)? Subscribe(long? expectedRevision = null)
     {
         lock (listenersLock)
         {
-            if (!Ready || listeners.Count >= 8) return null;
+            if (!Ready || listeners.Count >= 8 || (expectedRevision.HasValue && expectedRevision != Revision)) return null;
             var id = Guid.NewGuid();
             var channel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(32)
             {
@@ -158,6 +225,13 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     }
     public async Task StopPlaybackAsync()
     {
+        lock (selectionLock)
+        {
+            ++selectionVersion;
+            selection?.Cancel();
+            pending = null;
+            latestRequestId = null;
+        }
         await control.WaitAsync();
         try { await StopCoreAsync(true); }
         finally { control.Release(); }

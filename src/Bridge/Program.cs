@@ -29,6 +29,11 @@ app.Use(async (context, next) =>
         }
     }
     try { await next(context); }
+    catch (SelectionSupersededException) when (!context.Response.HasStarted)
+    {
+        context.Response.StatusCode = 409;
+        await context.Response.WriteAsJsonAsync(new { error = "Уже выбрана другая песня." });
+    }
     catch (ProviderException ex) when (!context.Response.HasStarted)
     {
         context.Response.StatusCode = 502;
@@ -36,7 +41,8 @@ app.Use(async (context, next) =>
     }
 });
 app.UseDefaultFiles();
-app.UseStaticFiles();
+app.UseStaticFiles(new StaticFileOptions { OnPrepareResponse = context =>
+    context.Context.Response.Headers.CacheControl = "no-cache" });
 app.MapGet("/healthz", (AudioEngine engine) => Results.Json(
     new { ready = engine.Ready, state = engine.State }, statusCode: engine.Ready ? 200 : 503));
 app.MapGet("/health/live", (AudioEngine engine) => Results.Json(
@@ -46,11 +52,12 @@ app.MapGet("/listen.m3u", (HttpRequest request) => Results.Text(
 app.MapGet("/api/status", (AudioEngine engine) => Results.Json(engine.Status));
 app.MapGet("/api/tracks", (string? q, IMusicProvider provider) => provider.Search(q));
 app.MapGet("/api/youtube/search", (string q, YoutubeProvider youtube, HttpContext context) => youtube.SearchAsync(q, context.RequestAborted));
-app.MapPost("/api/player/play", async (PlayRequest request, AudioEngine engine, MusicCatalog provider) =>
+app.MapPost("/api/player/play", async (PlayRequest request, AudioEngine engine, MusicCatalog provider, HttpContext context) =>
 {
+    if (request.RequestId?.Length > 64) return Results.BadRequest();
     var track = provider.Find(request.Id);
     if (track is null) return Results.NotFound(new { error = "Unknown track" });
-    await engine.PlayAsync(track);
+    await engine.PlayAsync(track, request.RequestId, context.RequestAborted);
     return Results.Ok(engine.Status);
 });
 app.MapPost("/api/player/next", async (AudioEngine engine, IMusicProvider provider) =>
@@ -69,13 +76,31 @@ app.MapPost("/api/player/stop", async (AudioEngine engine) =>
 });
 app.MapGet("/stream.mp3", async (HttpContext context, AudioEngine engine) =>
 {
+    var requestId = context.Request.Query["requestId"].ToString();
+    var revisionText = context.Request.Query["revision"].ToString();
+    if (requestId.Length > 64) { context.Response.StatusCode = 400; return; }
+    var deadline = DateTime.UtcNow.AddSeconds(90);
+    var observed = false;
+    // The browser calls play() directly during the tap; this connection waits for
+    // exactly that selection, retaining the mobile user gesture during preparation.
+    while (!string.IsNullOrEmpty(requestId))
+    {
+        if (engine.ActiveRequestId == requestId && engine.Ready) break;
+        observed |= engine.LatestRequestId == requestId;
+        if ((observed && engine.LatestRequestId != requestId) || engine.FailedRequestId == requestId || DateTime.UtcNow >= deadline)
+        { context.Response.StatusCode = 409; return; }
+        await Task.Delay(100, context.RequestAborted);
+    }
     if (!engine.Ready)
     {
         context.Response.StatusCode = 503;
         context.Response.Headers.RetryAfter = "2";
         return;
     }
-    var listener = engine.Subscribe();
+    long? expectedRevision = long.TryParse(revisionText, out var requestedRevision) ? requestedRevision : null;
+    if (expectedRevision.HasValue && expectedRevision != engine.Revision)
+    { context.Response.StatusCode = 409; return; }
+    var listener = engine.Subscribe(expectedRevision ?? engine.Revision);
     if (listener is null)
     {
         context.Response.StatusCode = 429;
@@ -98,4 +123,4 @@ app.MapGet("/stream.mp3", async (HttpContext context, AudioEngine engine) =>
 });
 app.Run();
 
-record PlayRequest(string Id);
+record PlayRequest(string Id, string? RequestId = null);
