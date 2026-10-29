@@ -7,6 +7,14 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 
 static void Check(bool value, string message) { if (!value) throw new Exception(message); }
+var startupSamples = new StartupMeasurements();
+Check(!startupSamples.Add(new("", 1, 2, null, 0)) && !startupSamples.Add(new("request", 1, -1, null, 0)) &&
+      !startupSamples.Add(new("request", 1, 2, null, double.NaN)), "Invalid startup sample accepted");
+for (var i = 0; i < 20; i++) Check(startupSamples.Add(new(i.ToString(), 10, 30, 20, 3)), "Valid timing rejected");
+Check(startupSamples.Snapshot.Length == 16 && startupSamples.Snapshot[0].RequestId == "4", "Startup samples are not bounded");
+var snapshot = startupSamples.Snapshot; snapshot[0] = new("changed", 0, 0, null, 0);
+Check(startupSamples.Snapshot[0].RequestId == "4", "Startup snapshot exposed mutable storage");
+Console.WriteLine("PASS: startup samples validate numeric fields, retain only 16 entries and expose a snapshot");
 static byte[] Frames(int count, int size = 220)
 {
     var data = new byte[count * size];
@@ -43,7 +51,7 @@ try { new AdtsPacketizer().Append(new byte[8]); throw new Exception("Invalid hea
 Console.WriteLine("PASS: AAC bytes preserved across split reads, valid frame boundaries and exact sample timing");
 
 var clock = Stopwatch.StartNew(); var sent = new List<byte[]>();
-await NativeAacPump.RunAsync(new MemoryStream(Frames(200)), packet => sent.Add(packet.Bytes), _ => { }, CancellationToken.None);
+await NativeAacPump.RunAsync(new MemoryStream(Frames(200)), packet => sent.Add(packet.Bytes), _ => { }, CancellationToken.None, 8);
 Check(sent.SelectMany(b => b).SequenceEqual(Frames(200)), "Paced output changed AAC bytes");
 Check(clock.Elapsed.TotalSeconds >= 4.5 && clock.Elapsed.TotalSeconds < 6, "EOF did not wait for the initial audio burst to play out");
 long buffered = 0, maximum = 0;
@@ -61,6 +69,21 @@ using (var stop = new CancellationTokenSource())
 }
 Check(maximum <= 2 * 1024 * 1024 + 4096 && maximum >= 2 * 1024 * 1024, "Read-ahead is not bounded to 2 MiB");
 Console.WriteLine("PASS: initial burst, real-time pacing through EOF, bounded compressed reserve and prompt cancellation");
+using (var burstStop = new CancellationTokenSource())
+{
+    var burstClock = Stopwatch.StartNew(); double burstAudio = 0;
+    try
+    {
+        await NativeAacPump.RunAsync(new MemoryStream(Frames(1000)), packet =>
+        {
+            burstAudio += packet.Seconds;
+            if (burstAudio >= 8) burstStop.Cancel();
+        }, _ => { }, burstStop.Token, 8);
+    }
+    catch (OperationCanceledException) { }
+    Check(burstAudio >= 8 && burstClock.Elapsed.TotalSeconds < 1, "Eight-second initial audio was delayed instead of sent immediately");
+}
+Console.WriteLine("PASS: larger initial decoder burst is sent immediately without waiting eight seconds");
 
 var handler = new DelayedHandler();
 var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["YOUTUBE_PROVIDER_URL"] = "http://fixture" }).Build();

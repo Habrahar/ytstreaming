@@ -5,8 +5,9 @@ namespace Bridge;
 
 public static class NativeAacPump
 {
-    public static async Task RunAsync(Stream source, Action<AudioPacket> publish, Action<long> buffered, CancellationToken token)
+    public static async Task RunAsync(Stream source, Action<AudioPacket> publish, Action<long> buffered, CancellationToken token, double startupSeconds = 3)
     {
+        if (!double.IsFinite(startupSeconds) || startupSeconds is < 3 or > 8) throw new ArgumentOutOfRangeException(nameof(startupSeconds));
         using var inputCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
         // Compressed bytes only, at most 2 MiB plus one input block. No audio file.
         var ahead = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(512) { SingleReader = true, SingleWriter = true });
@@ -37,7 +38,7 @@ public static class NativeAacPump
         {
             if (!clock.IsRunning) clock.Start();
             // Fill the phone's decoder once, then pace by exact AAC sample counts.
-            var delay = emitted - 3 - clock.Elapsed.TotalSeconds;
+            var delay = emitted - startupSeconds - clock.Elapsed.TotalSeconds;
             if (delay > 0) await Task.Delay(TimeSpan.FromSeconds(delay), token);
             token.ThrowIfCancellationRequested(); publish(packet); emitted += packet.Seconds;
         }

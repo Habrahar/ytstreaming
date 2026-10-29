@@ -1,4 +1,5 @@
 import io
+import base64
 import subprocess
 import tempfile
 import time
@@ -30,6 +31,60 @@ class Handler:
 
 
 class ResumeCheck(unittest.TestCase):
+    def test_cancellation_keeps_warm_supervisor_and_kills_only_job_group(self):
+        with tempfile.TemporaryDirectory() as folder:
+            marker=Path(folder)/'job-pids'
+            helper=Path(folder)/'supervisor.py'
+            helper.write_text('import extract,time,sys,os,subprocess\nfrom pathlib import Path\n'
+                'def prime(self): self.visitor="fixture-context"; self.visitor_at=time.monotonic()\n'
+                'def prepare(video_id,session):\n'
+                ' if video_id=="AAAAAAAAAAA":\n'
+                '  node=subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"])\n'
+                f'  Path({str(marker)!r}).write_text(str(os.getpid())+" "+str(node.pid))\n'
+                '  time.sleep(60)\n'
+                ' return {"id":video_id,"warm":bool(session.visitor)}\n'
+                'extract.ExtractionSession.prime=prime\nextract.prepare=prepare\nextract.run_worker()\n')
+            try:
+                with patch.object(server,'EXTRACTOR_PATH',helper):
+                    with self.assertRaises(server.ResolveCancelled):
+                        server.extract_source('AAAAAAAAAAA',lambda:marker.exists())
+                    supervisor=server.extractor_worker
+                    self.assertIsNotNone(supervisor); self.assertIsNone(supervisor.poll())
+                    started=time.monotonic(); result=server.extract_source('BBBBBBBBBBB')
+                    self.assertTrue(result['warm']); self.assertEqual(result['id'],'BBBBBBBBBBB')
+                    self.assertIs(server.extractor_worker,supervisor)
+                    self.assertLess(time.monotonic()-started,1.5)
+                    for pid in map(int,marker.read_text().split()):
+                        stat=Path(f'/proc/{pid}/stat')
+                        until=time.monotonic()+2
+                        while stat.exists() and stat.read_text().split()[2]!='Z' and time.monotonic()<until:time.sleep(.05)
+                        self.assertTrue(not stat.exists() or stat.read_text().split()[2]=='Z','Cancelled descendant is still running')
+            finally:server.stop_extractor()
+
+    def test_worker_protocol_accepts_larger_prefix_response(self):
+        with tempfile.TemporaryDirectory() as folder:
+            helper=Path(folder)/'large-worker.py'
+            helper.write_text('import json,sys\nprint(json.dumps({"ready":True}),flush=True)\nfor line in sys.stdin: print(json.dumps({"result":{"prefix":"x"*350000}}),flush=True)\n')
+            try:
+                with patch.object(server,'EXTRACTOR_PATH',helper):
+                    result=server.extract_source('AAAAAAAAAAA')
+                    self.assertEqual(len(result['prefix']),350000)
+            finally:server.stop_extractor()
+
+    def test_larger_prefix_cache_is_bounded_and_keeps_exact_resume_position(self):
+        data=b'x'*262144
+        info={'url':'https://media.googlevideo.com/audio','headers':{},'prefix':base64.b64encode(data).decode(),
+              'totalBytes':300000,'mimeType':'audio/mp4','codec':'mp4a.40.2'}
+        with patch.dict(server.audio_cache,{},clear=True), patch.dict(server.prefix_cache,{},clear=True), \
+             patch.object(server,'extract_source',return_value=info):
+            for n in range(9):server.resolve(str(n)*11)
+            self.assertEqual(len(server.prefix_cache),8)
+            self.assertEqual(sum(len(p[1]) for p in server.prefix_cache.values()),2*1024*1024)
+            self.assertEqual(server.prefix_cache['88888888888'][1],data)
+            info['prefix']=base64.b64encode(data+b'x').decode()
+            server.resolve('AAAAAAAAAAA')
+            self.assertNotIn('AAAAAAAAAAA',server.prefix_cache)
+
     def test_buffered_prefix_is_sent_before_upstream_and_not_repeated(self):
         handler=Handler(); ranges=[]
         class Session:

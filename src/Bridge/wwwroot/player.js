@@ -87,6 +87,13 @@ function connect(query) {
   });
 }
 
+function reportStartup(timing) {
+  if(!timing.commandDone || !timing.playingMs || timing.reported) return;
+  timing.reported=true;
+  if(startupTiming===timing) startupTiming=null;
+  api('/api/player/startups',{requestId:timing.requestId,commandMs:timing.commandMs,playingMs:timing.playingMs,
+    metadataMs:timing.metadataMs,bufferedSeconds:timing.bufferedSeconds}).catch(()=>{});
+}
 function startSelection(track, path, body, direction = null, exact = true) {
   reconnectAttempts=0;
   const sequence = ++selectionSequence;
@@ -94,12 +101,19 @@ function startSelection(track, path, body, direction = null, exact = true) {
   // Aborting its HTTP request first could roll that selection back before Next.
   controlRequest = new AbortController();
   const requestId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+  const timing = {requestId, started:Date.now(), commandMs:0, commandDone:false, playingMs:0, metadataMs:null, bufferedSeconds:0};
+  startupTiming = timing;
   pending = {track, requestId, direction, exact};
   wantsAudio = true;
   attachedRevision = -1;
   attachedStreamGeneration = -1;
-  notice(); closeSearch(); render();
-  const command = api(path, {...body, requestId, clientId, commandSequence:sequence}, controlRequest.signal);
+  notice(); closeSearch();
+  const command = api(path, {...body, requestId, clientId, commandSequence:sequence}, controlRequest.signal)
+    .then(status=>{
+      timing.commandMs=Math.max(0,Date.now()-timing.started); timing.commandDone=true;
+      if(sequence===selectionSequence) reportStartup(timing);
+      return status;
+    });
   const playing = connect('requestId=' + encodeURIComponent(requestId));
   Promise.all([command, playing]).then(([status]) => {
     if (sequence !== selectionSequence) return;
@@ -109,6 +123,7 @@ function startSelection(track, path, body, direction = null, exact = true) {
     render();
   }).catch(error => {
     if (sequence !== selectionSequence) return;
+    if(startupTiming===timing) startupTiming=null;
     pending = null; navigationBurst=null; wantsAudio = false; disconnect();
     phase = 'error'; notice(error.message); render();
   });
@@ -253,11 +268,26 @@ if(!window.coverFan) {
   $('#artwork').onerror=()=>$('#cover').classList.remove('has-art');
 }
 $('#stop').onclick=async()=>{
+  startupTiming=null;
   const sequence=++selectionSequence; controlRequest?.abort(); pending=null; navigationBurst=null; wantsAudio=false; disconnect(); phase='idle'; render();
   try { const status=await api('/api/player/stop',{clientId,commandSequence:sequence}); if(sequence===selectionSequence) {server=status; render();} } catch(error) { if(sequence===selectionSequence) notice(error.message); }
 };
-audio.onplaying=()=>{ reconnectAttempts=0; mediaControls.register(); phase='playing'; notice(); render(); };
-audio.addEventListener('loadedmetadata',()=>mediaControls.register());
+let startupTiming=null;
+audio.onplaying=()=>{
+  if(startupTiming && !startupTiming.playingMs) {
+    startupTiming.playingMs=Math.max(1,Date.now()-startupTiming.started);
+    try {
+      const b=audio.buffered, reserve=b.length?b.end(b.length-1)-audio.currentTime:0;
+      startupTiming.bufferedSeconds=Number.isFinite(reserve)?Math.min(600,Math.max(0,reserve)):0;
+    } catch {}
+    reportStartup(startupTiming);
+  }
+  reconnectAttempts=0; mediaControls.register(); phase='playing'; notice(); render();
+};
+audio.addEventListener('loadedmetadata',()=>{
+  if(startupTiming && startupTiming.metadataMs===null) startupTiming.metadataMs=Math.max(0,Date.now()-startupTiming.started);
+  mediaControls.register();
+});
 window.addEventListener('pageshow',()=>{mediaControls.register(); render();});
 audio.onwaiting=()=>{ if(wantsAudio) { phase='buffering'; render(); } };
 audio.onpause=()=>{ if(!intentionalReset && !pending && !wantsAudio) { phase='paused'; render(); } };

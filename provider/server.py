@@ -145,10 +145,12 @@ class ResolveCancelled(Exception): pass
 EXTRACTOR_PATH = Path(__file__).with_name('extract.py')
 extractor_lock = threading.Lock()
 extractor_worker = None
+extractor_ready = False
 
 
 def stop_extractor():
-    global extractor_worker
+    global extractor_worker, extractor_ready
+    extractor_ready = False
     process, extractor_worker = extractor_worker, None
     if process is None: return
     if process.poll() is None:
@@ -173,7 +175,7 @@ def worker_message(process, cancelled, deadline):
             chunk=os.read(process.stdout.fileno(),65536)
             if not chunk: raise ValueError('Extraction worker stopped')
             data.extend(chunk)
-            if len(data)>196608: raise ValueError('Oversized extraction response')
+            if len(data)>524288: raise ValueError('Oversized extraction response')
             if b'\n' in data:
                 line,rest=data.split(b'\n',1)
                 if rest: raise ValueError('Unexpected extraction response')
@@ -181,13 +183,14 @@ def worker_message(process, cancelled, deadline):
 
 
 def ready_extractor(cancelled,deadline):
-    global extractor_worker
+    global extractor_worker, extractor_ready
     if extractor_worker is not None and extractor_worker.poll() is not None: stop_extractor()
     if extractor_worker is None:
         extractor_worker=subprocess.Popen([sys.executable,str(EXTRACTOR_PATH),'--worker'],
             stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True,bufsize=0)
         if worker_message(extractor_worker,cancelled,deadline).get('ready') is not True:
             raise ValueError('Extraction worker not ready')
+        extractor_ready = True
     return extractor_worker
 
 
@@ -201,6 +204,15 @@ def extract_source(video_id, cancelled=None):
             process=ready_extractor(cancelled,deadline)
             process.stdin.write((video_id+'\n').encode()); process.stdin.flush()
             message=worker_message(process,cancelled,deadline)
+        except ResolveCancelled:
+            # The warmed supervisor forks each task. Drain exactly its one reply
+            # after cancelling that child, preserving imports and visitor context.
+            try:
+                if not extractor_ready or extractor_worker is None: raise ValueError('No warm supervisor')
+                os.kill(extractor_worker.pid, signal.SIGUSR1)
+                worker_message(extractor_worker,None,time.monotonic()+2)
+            except Exception: stop_extractor()
+            raise
         except BaseException:
             stop_extractor() # Still kill the entire group, including Node.
             raise
@@ -240,7 +252,7 @@ def resolve(video_id, cancelled=None):
         prefix_cache.pop(video_id,None)
         if info.get('prefix') and isinstance(info.get('totalBytes'),int):
             data=base64.b64decode(info['prefix'],validate=True)
-            if 0<len(data)<=65536 and info['totalBytes']>=len(data):
+            if 0<len(data)<=262144 and info['totalBytes']>=len(data):
                 mime=info.get('mimeType','')
                 if mime not in ('audio/mp4','video/mp4','audio/webm','video/webm','application/octet-stream'): mime='application/octet-stream'
                 prefix_cache[video_id]=(source,data,mime,info['totalBytes'])
@@ -340,7 +352,7 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         params = parse_qs(url.query)
         if url.path == "/healthz":
-            return self.send_json(200, {"ready": True, "proxyConfigured": bool(PROXY)})
+            return self.send_json(200, {"ready": True, "extractorReady": extractor_ready, "proxyConfigured": bool(PROXY)})
         if url.path == '/artwork':
             video_id = params.get('id', [''])[0]
             if not VIDEO_ID.fullmatch(video_id):

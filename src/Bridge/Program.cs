@@ -76,6 +76,10 @@ app.MapGet("/health/live", (AudioEngine engine) => Results.Json(
 app.MapGet("/listen.m3u", (HttpRequest request) => Results.Text(
     $"#EXTM3U\n#EXTINF:-1,ytstreaming\n{request.Scheme}://{request.Host}/stream\n", "audio/x-mpegurl"));
 app.MapGet("/api/status", (AudioEngine engine, PlaybackNavigator navigator) => Results.Json(PlayerStatus(engine, navigator)));
+var startupMeasurements = new StartupMeasurements();
+app.MapGet("/api/player/startups", () => startupMeasurements.Snapshot);
+app.MapPost("/api/player/startups", (StartupSample sample) =>
+    startupMeasurements.Add(sample) ? Results.NoContent() : Results.BadRequest());
 app.MapGet("/api/player/neighbors", (long revision, long version, PlaybackNavigator navigator, HttpContext context) =>
     navigator.PreviewAsync(revision, version, context.RequestAborted));
 app.MapGet("/api/tracks", (string? q, IMusicProvider provider) => provider.Search(q));

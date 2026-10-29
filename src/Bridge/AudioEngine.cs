@@ -42,6 +42,7 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     private Task? pump;
     private long bytes;
     private long lastDataTicks;
+    private double StartupSeconds { get; } = int.TryParse(config["AUDIO_STARTUP_SECONDS"], out var burst) && burst is >= 3 and <= 8 ? burst : 3;
     private volatile string state = "stopped";
     public Track? Current { get; private set; }
     public string State => state;
@@ -54,7 +55,7 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     public string? LatestRequestId => latestRequestId;
     public string? FailedRequestId => failedRequestId;
     public bool Ready => state == "playing" &&
-        DateTime.UtcNow.Ticks - Interlocked.Read(ref lastDataTicks) < TimeSpan.FromSeconds(5).Ticks;
+        DateTime.UtcNow.Ticks - Interlocked.Read(ref lastDataTicks) < TimeSpan.FromSeconds(nativeCopy ? StartupSeconds + 2 : 5).Ticks;
     public object Status
     {
         get
@@ -197,7 +198,7 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
         lock (listenersLock)
         {
             replay.Enqueue(new(chunk,seconds)); replayBytes += chunk.Length; replaySeconds += seconds;
-            while ((replayBytes > 65536 || replaySeconds > 4) && replay.Count > 1)
+            while ((replayBytes > (nativeCopy ? 262144 : 65536) || replaySeconds > (nativeCopy ? StartupSeconds + 1 : 4)) && replay.Count > 1)
             {
                 var old = replay.Dequeue(); replayBytes -= old.Bytes.Length; replaySeconds -= old.Seconds;
             }
@@ -215,7 +216,7 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
         var stderr = ReadErrorsAsync(encoder, token);
         try
         {
-            if (copy) await NativeAacPump.RunAsync(encoder.StandardOutput.BaseStream, packet => Publish(packet.Bytes,packet.Seconds), delta => Interlocked.Add(ref aheadBytes, delta), token);
+            if (copy) await NativeAacPump.RunAsync(encoder.StandardOutput.BaseStream, packet => Publish(packet.Bytes,packet.Seconds), delta => Interlocked.Add(ref aheadBytes, delta), token, StartupSeconds);
             else
             {
                 var buffer = new byte[4096];
@@ -264,7 +265,7 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
         {
             if (!Ready || listeners.Count >= 8 || (expectedRevision.HasValue && expectedRevision != Revision)) return null;
             var id = Guid.NewGuid();
-            var channel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(64)
+            var channel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(128)
             {
                 FullMode = BoundedChannelFullMode.Wait, SingleReader = true, SingleWriter = true
             });
