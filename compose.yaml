@@ -12,6 +12,8 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
+    volumes:
+      - library:/data
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     mem_limit: 160m
@@ -19,6 +21,7 @@ services:
     pids_limit: 64
     environment:
       YOUTUBE_PROVIDER_URL: http://provider:8081
+      LIBRARY_DIRECTORY: /data
       DOTNET_GCHeapHardLimit: "0x4000000"
       Logging__LogLevel__Default: Warning
       Logging__LogLevel__Microsoft.AspNetCore: Warning
@@ -60,3 +63,5 @@ services:
       options:
         max-size: 3m
         max-file: "2"
+volumes:
+  library:

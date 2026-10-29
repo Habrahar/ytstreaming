@@ -91,7 +91,7 @@ def radio(video_id):
     return tracks
 
 
-def artwork(video_id, preview=False):
+def artwork(video_id, preview=False, thumbnail=None):
     key = (video_id, preview)
     with cache_lock:
         cached = artwork_cache.get(key)
@@ -105,7 +105,9 @@ def artwork(video_id, preview=False):
         except Exception: pass
     with cache_lock:
         track = track_cache.get(video_id)
-    url = (track or {}).get('thumbnail') or ''
+    url = (track or {}).get('thumbnail') or thumbnail or ''
+    if len(url) > 2048:
+        raise ValueError('Artwork URL is too long')
     host = urlparse(url).hostname or ''
     if not url.startswith('https://') or not (host == 'i.ytimg.com' or host.endswith('.googleusercontent.com')):
         raise ValueError('No supported artwork')
@@ -272,7 +274,7 @@ class Handler(BaseHTTPRequestHandler):
             if not artwork_slots.acquire(timeout=5):
                 return self.send_json(503, {'error':'Artwork busy'})
             try:
-                data, content_type = artwork(video_id, params.get('size',[''])[0] == 'small')
+                data, content_type = artwork(video_id, params.get('size',[''])[0] == 'small', params.get('thumbnail',[''])[0])
                 self.send_response(200)
                 self.send_header('Content-Type', content_type)
                 self.send_header('Content-Length', str(len(data)))

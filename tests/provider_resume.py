@@ -30,6 +30,23 @@ class Handler:
 
 
 class ResumeCheck(unittest.TestCase):
+    def test_saved_preview_uses_validated_thumbnail_after_catalog_reset(self):
+        urls=[]
+        class Session:
+            def __enter__(self): return self
+            def __exit__(self,*_): pass
+            def get(self,url,**kwargs):
+                urls.append(url)
+                return Response(200,[b'image'],{'Content-Type':'image/jpeg'})
+        with patch.dict(server.track_cache,{},clear=True), patch.dict(server.artwork_cache,{},clear=True), \
+             patch.object(server,'NetworkSession',Session), patch.object(server,'radio') as radio:
+            server.artwork('AAAAAAAAAAA',preview=True,thumbnail='https://yt3.googleusercontent.com/saved=w120-h120-l90-rj')
+            self.assertIn('=w96-h96',urls[0]); radio.assert_not_called()
+        with patch.dict(server.track_cache,{},clear=True), patch.dict(server.artwork_cache,{},clear=True), \
+             patch.object(server,'NetworkSession') as network:
+            with self.assertRaises(ValueError): server.artwork('AAAAAAAAAAA',preview=True,thumbnail='https://127.0.0.1/private')
+            network.assert_not_called()
+
     def test_search_preview_does_not_fetch_radio_or_share_fullsize_cache(self):
         fetched=[]
         class Session:

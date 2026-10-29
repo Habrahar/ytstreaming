@@ -5,59 +5,9 @@ let wantsAudio = false, phase = 'idle', controlRequest = null, refreshing = fals
 let searchRequest = null, searchSequence = 0, searchTimer, intentionalReset = false;
 let completedSearch = '';
 let artworkTrack = null;
-let thumbnailGeneration = 0, thumbnailActive = 0, thumbnailQueue = [];
-let thumbnailAbort = new AbortController();
-const thumbnailUrls = new Set();
-const thumbnailObserver = 'IntersectionObserver' in window ? new IntersectionObserver(entries => {
-  for (const entry of entries) if (entry.isIntersecting) enqueueThumbnail(entry.target);
-}, {root:$('#results'), rootMargin:'60px'}) : null;
-
-function stopThumbnails(release = false) {
-  ++thumbnailGeneration; thumbnailAbort.abort(); thumbnailAbort = new AbortController();
-  thumbnailQueue = []; thumbnailActive = 0;
-  for (const image of document.querySelectorAll('.search-art')) image.dataset.queued='';
-  if (release) {
-    thumbnailObserver?.disconnect();
-    for (const url of thumbnailUrls) URL.revokeObjectURL(url);
-    thumbnailUrls.clear();
-  }
-}
-
-function enqueueThumbnail(image) {
-  if (!$('#searchShell').classList.contains('open') || image.dataset.loaded || image.dataset.queued) return;
-  image.dataset.queued='1'; thumbnailObserver?.unobserve(image);
-  thumbnailQueue.push(image); pumpThumbnails();
-}
-
-function watchThumbnails() {
-  for (const image of document.querySelectorAll('.search-art')) {
-    if (image.dataset.loaded) continue;
-    if (thumbnailObserver) { thumbnailObserver.unobserve(image); thumbnailObserver.observe(image); }
-    else enqueueThumbnail(image);
-  }
-}
-
-function pumpThumbnails() {
-  while (thumbnailActive < 2 && thumbnailQueue.length) {
-    const image=thumbnailQueue.shift(), generation=thumbnailGeneration, signal=thumbnailAbort.signal;
-    ++thumbnailActive;
-    // Two low-priority requests at most. Closing search aborts them before
-    // audio preparation starts, leaving connections free for play()/controls.
-    fetch('/api/artwork/'+encodeURIComponent(image.dataset.videoId)+'?size=small', {signal,cache:'force-cache',priority:'low'})
-      .then(response=>{ if(!response.ok) throw Error('No artwork'); return response.blob(); })
-      .then(blob=>{
-        if(generation!==thumbnailGeneration || !image.isConnected) return;
-        const url=URL.createObjectURL(blob); thumbnailUrls.add(url);
-        image.onload=()=>{ image.dataset.loaded='1'; image.parentElement.classList.add('loaded'); };
-        image.src=url;
-      })
-      .catch(()=>{})
-      .finally(()=>{
-        if(generation!==thumbnailGeneration) return;
-        image.dataset.queued=''; --thumbnailActive; pumpThumbnails();
-      });
-  }
-}
+const searchArt = new TrackArtLoader($('#results'));
+function stopThumbnails(release=false) { searchArt.stop(release); }
+function watchThumbnails() { searchArt.watch(); }
 
 async function api(path, body, signal) {
   const response = await fetch(path, {signal, cache:'no-store', ...(body === undefined ? {} : {
@@ -99,6 +49,7 @@ function render() {
       artwork:artworkUrl?[{src:new URL(artworkUrl,location.href).href}]:[]});
     navigator.mediaSession.playbackState = phase === 'playing' ? 'playing' : 'paused';
   }
+  window.libraryUI?.renderCurrent(track);
 }
 
 function disconnect() {
@@ -176,6 +127,7 @@ async function refresh() {
     const status = await api('/api/status');
     if (sequence !== selectionSequence || (server && status.revision < server.revision)) return;
     server = status;
+    window.libraryUI?.sync(status.libraryRevision);
     if (pending && status.latestRequestId === pending.requestId && status.pending)
       pending.track = status.pending;
     if (!pending && wantsAudio && server.ready && attachedRevision !== server.revision) {
@@ -206,20 +158,25 @@ async function search() {
     if (sequence !== searchSequence) return;
     completedSearch=query;
     $('#searchHint').textContent = tracks.length ? 'Нажми на песню, чтобы включить' : 'Ничего не найдено. Попробуй другой запрос.';
-    for (const track of tracks) {
-      const row = document.createElement('button'); row.type='button'; row.className='result'; row.setAttribute('role','option');
-      const icon=document.createElement('span'); icon.className='result-icon'; icon.textContent='♫';
-      const image=document.createElement('img'); image.className='search-art'; image.alt='';
-      image.decoding='async'; image.dataset.videoId=track.id.slice(8); icon.append(image);
-      const copy=document.createElement('span'); copy.className='result-copy';
-      const title=document.createElement('strong'); title.textContent=track.title;
-      const artist=document.createElement('small'); artist.textContent=track.artist;
-      const duration=document.createElement('span'); duration.className='result-duration'; duration.textContent=track.duration||'';
-      copy.append(title,artist); row.append(icon,copy,duration);
-      row.onclick=()=>choose(track); results.append(row);
-    }
+    for (const track of tracks) results.append(createTrackRow(track));
     watchThumbnails();
   } catch(error) { if (sequence === searchSequence && error.name !== 'AbortError') $('#searchHint').textContent=error.message; }
+}
+
+function createTrackRow(track, select = choose) {
+  const row=document.createElement('div'); row.className='track-row'; row.setAttribute('role','listitem');
+  const play=document.createElement('button'); play.type='button'; play.className='result';
+  play.setAttribute('aria-label','Включить '+track.title+' — '+track.artist);
+  const icon=document.createElement('span'); icon.className='result-icon'; icon.textContent='♫';
+  const image=document.createElement('img'); image.className='track-art'; image.alt='';
+  image.decoding='async'; image.dataset.videoId=track.id.slice(8); icon.append(image);
+  const copy=document.createElement('span'); copy.className='result-copy';
+  const title=document.createElement('strong'); title.textContent=track.title;
+  const artist=document.createElement('small'); artist.textContent=track.artist;
+  const duration=document.createElement('span'); duration.className='result-duration'; duration.textContent=track.duration||'';
+  copy.append(title,artist); play.append(icon,copy,duration); play.onclick=()=>select(track); row.append(play);
+  window.libraryUI?.decorate(row,track);
+  return row;
 }
 
 $('#search').onfocus = () => {

@@ -10,14 +10,17 @@ builder.Services.AddSingleton<MusicCatalog>();
 builder.Services.AddSingleton<IMusicProvider>(sp => sp.GetRequiredService<MusicCatalog>());
 builder.Services.AddSingleton<AudioEngine>();
 builder.Services.AddSingleton<PlaybackNavigator>();
+builder.Services.AddSingleton<MusicLibrary>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AudioEngine>());
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 4096);
 var app = builder.Build();
+var musicLibrary = app.Services.GetRequiredService<MusicLibrary>();
 var statusJsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 JsonNode PlayerStatus(AudioEngine engine, PlaybackNavigator navigator)
 {
     var status = JsonSerializer.SerializeToNode(engine.Status, statusJsonOptions)!;
     status["navigation"] = JsonSerializer.SerializeToNode(navigator.Status, statusJsonOptions);
+    status["libraryRevision"] = musicLibrary.Revision;
     return status;
 }
 
@@ -50,6 +53,16 @@ app.Use(async (context, next) =>
         context.Response.StatusCode = 502;
         await context.Response.WriteAsJsonAsync(new { error = ex.Message });
     }
+    catch (LibraryException ex) when (!context.Response.HasStarted)
+    {
+        context.Response.StatusCode = 400;
+        await context.Response.WriteAsJsonAsync(new { error = ex.Message });
+    }
+    catch (LibraryUnavailableException) when (!context.Response.HasStarted)
+    {
+        context.Response.StatusCode = 503;
+        await context.Response.WriteAsJsonAsync(new { error = "Не удалось сохранить библиотеку на Pi. Изменение не сохранено; попробуй ещё раз." });
+    }
 });
 app.UseDefaultFiles();
 app.UseStaticFiles(new StaticFileOptions { OnPrepareResponse = context =>
@@ -63,20 +76,37 @@ app.MapGet("/listen.m3u", (HttpRequest request) => Results.Text(
 app.MapGet("/api/status", (AudioEngine engine, PlaybackNavigator navigator) => Results.Json(PlayerStatus(engine, navigator)));
 app.MapGet("/api/tracks", (string? q, IMusicProvider provider) => provider.Search(q));
 app.MapGet("/api/youtube/search", (string q, YoutubeProvider youtube, HttpContext context) => youtube.SearchAsync(q, context.RequestAborted));
-app.MapGet("/api/artwork/{videoId}", async (string videoId, MusicCatalog catalog, PlaybackNavigator navigator, AudioEngine engine, YoutubeProvider youtube, HttpContext context) =>
+Track? FindTrack(string? id, MusicCatalog catalog, PlaybackNavigator navigator, AudioEngine engine, MusicLibrary library) =>
+    string.IsNullOrEmpty(id) || id.Length > 64 ? null :
+        catalog.Find(id) ?? library.Find(id) ?? navigator.Find(id) ?? (engine.Current?.Id == id ? engine.Current : null);
+app.MapGet("/api/library", (MusicLibrary library) => library.Snapshot);
+app.MapPost("/api/library/likes", (LikeRequest request, MusicLibrary library, MusicCatalog catalog, PlaybackNavigator navigator, AudioEngine engine) =>
+{
+    var track = FindTrack(request.Id, catalog, navigator, engine, library);
+    if (track is null) return Results.NotFound(new { error = "Песня не найдена. Повтори поиск." });
+    return Results.Ok(library.Like(track, request.Liked));
+});
+app.MapPost("/api/library/playlists", (PlaylistRequest request, MusicLibrary library) => library.CreatePlaylist(request.Name));
+app.MapPost("/api/library/playlists/{playlistId}/tracks", (string playlistId, MembershipRequest request, MusicLibrary library, MusicCatalog catalog, PlaybackNavigator navigator, AudioEngine engine) =>
+{
+    var track = FindTrack(request.Id, catalog, navigator, engine, library);
+    if (track is null) return Results.NotFound(new { error = "Песня не найдена. Повтори поиск." });
+    return Results.Ok(library.SetMembership(playlistId, track, request.Added));
+});
+app.MapGet("/api/artwork/{videoId}", async (string videoId, MusicCatalog catalog, PlaybackNavigator navigator, AudioEngine engine, MusicLibrary library, YoutubeProvider youtube, HttpContext context) =>
 {
     if (videoId.Length != 11 || videoId.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '-' or '_'))) return Results.NotFound();
     var id = "youtube:" + videoId;
-    var track = catalog.Find(id) ?? navigator.Find(id) ?? (engine.Current?.Id == id ? engine.Current : null);
+    var track = FindTrack(id, catalog, navigator, engine, library);
     if (track is null) return Results.NotFound();
     var artwork = await youtube.ArtworkAsync(track, context.RequestAborted, context.Request.Query["size"] == "small");
     context.Response.Headers.CacheControl = "private, max-age=3600";
     return Results.File(artwork.Bytes, artwork.ContentType);
 });
-app.MapPost("/api/player/play", async (PlayRequest request, AudioEngine engine, PlaybackNavigator navigator, MusicCatalog provider, HttpContext context) =>
+app.MapPost("/api/player/play", async (PlayRequest request, AudioEngine engine, PlaybackNavigator navigator, MusicCatalog provider, MusicLibrary library, HttpContext context) =>
 {
     if (request.RequestId?.Length > 64) return Results.BadRequest();
-    var track = provider.Find(request.Id) ?? navigator.Find(request.Id) ?? (engine.Current?.Id == request.Id ? engine.Current : null);
+    var track = FindTrack(request.Id, provider, navigator, engine, library);
     if (track is null) return Results.NotFound(new { error = "Unknown track" });
     await navigator.PlayAsync(track, request.RequestId, context.RequestAborted);
     return Results.Ok(PlayerStatus(engine, navigator));
@@ -149,3 +179,6 @@ app.Run();
 
 record PlayRequest(string Id, string? RequestId = null);
 record NavigationRequest(string? RequestId = null);
+record LikeRequest(string Id, bool Liked);
+record PlaylistRequest(string? Name);
+record MembershipRequest(string Id, bool Added);
