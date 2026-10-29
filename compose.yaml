@@ -18,6 +18,7 @@ services:
     cpus: 0.50
     pids_limit: 64
     environment:
+      YOUTUBE_PROVIDER_URL: http://provider:8081
       DOTNET_GCHeapHardLimit: "0x4000000"
       Logging__LogLevel__Default: Warning
       Logging__LogLevel__Microsoft.AspNetCore: Warning
@@ -31,4 +32,31 @@ services:
       driver: json-file
       options:
         max-size: 5m
+        max-file: "2"
+  provider:
+    image: ytstreaming-provider:local
+    build:
+      context: .
+      dockerfile: provider/Dockerfile
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 0.75
+    mem_limit: 256m
+    pids_limit: 64
+    environment:
+      YOUTUBE_PROXY: ${YOUTUBE_PROXY:-}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 3m
         max-file: "2"

@@ -8,3 +8,5 @@ artifacts/
 cookies*.txt
 oauth*.json
 browser*.json
+__pycache__/
+*.py[cod]

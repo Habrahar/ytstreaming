@@ -2,11 +2,12 @@ namespace Bridge;
 
 // Catalog and playback resolution are separate contracts. A future catalog
 // adapter must not assume that metadata grants permission/access to audio.
-public record Track(string Id, string Title, string Artist, string Provider);
+public record Track(string Id, string Title, string Artist, string Provider, string? Duration = null, string? Thumbnail = null);
+public record AudioSource(string Location, bool Loop);
 public interface IMusicProvider
 {
     Track[] Search(string? query);
-    string ResolveAudio(Track track);
+    Task<AudioSource> ResolveAudioAsync(Track track);
 }
 
 public sealed class TestProvider : IMusicProvider
@@ -49,4 +50,14 @@ public sealed class TestProvider : IMusicProvider
         }
         return path;
     }
+
+    public Task<AudioSource> ResolveAudioAsync(Track track) => Task.FromResult(new AudioSource(ResolveAudio(track), true));
+}
+
+public sealed class MusicCatalog(TestProvider test, YoutubeProvider youtube) : IMusicProvider
+{
+    public Track[] Search(string? query) => test.Search(query);
+    public Track? Find(string id) => test.Search(null).FirstOrDefault(t => t.Id == id) ?? youtube.Find(id);
+    public Task<AudioSource> ResolveAudioAsync(Track track) => track.Provider == "youtube"
+        ? youtube.ResolveAudioAsync(track) : test.ResolveAudioAsync(track);
 }

@@ -1,7 +1,10 @@
 using Bridge;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddSingleton<IMusicProvider, TestProvider>();
+builder.Services.AddSingleton<TestProvider>();
+builder.Services.AddSingleton<YoutubeProvider>();
+builder.Services.AddSingleton<MusicCatalog>();
+builder.Services.AddSingleton<IMusicProvider>(sp => sp.GetRequiredService<MusicCatalog>());
 builder.Services.AddSingleton<AudioEngine>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AudioEngine>());
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 4096);
@@ -25,7 +28,12 @@ app.Use(async (context, next) =>
             return;
         }
     }
-    await next(context);
+    try { await next(context); }
+    catch (ProviderException ex) when (!context.Response.HasStarted)
+    {
+        context.Response.StatusCode = 502;
+        await context.Response.WriteAsJsonAsync(new { error = ex.Message });
+    }
 });
 app.UseDefaultFiles();
 app.UseStaticFiles();
@@ -37,15 +45,18 @@ app.MapGet("/listen.m3u", (HttpRequest request) => Results.Text(
     $"#EXTM3U\n#EXTINF:-1,ytstreaming\n{request.Scheme}://{request.Host}/stream.mp3\n", "audio/x-mpegurl"));
 app.MapGet("/api/status", (AudioEngine engine) => Results.Json(engine.Status));
 app.MapGet("/api/tracks", (string? q, IMusicProvider provider) => provider.Search(q));
-app.MapPost("/api/player/play", async (PlayRequest request, AudioEngine engine, IMusicProvider provider) =>
+app.MapGet("/api/youtube/search", (string q, YoutubeProvider youtube, HttpContext context) => youtube.SearchAsync(q, context.RequestAborted));
+app.MapPost("/api/player/play", async (PlayRequest request, AudioEngine engine, MusicCatalog provider) =>
 {
-    var track = provider.Search(null).FirstOrDefault(t => t.Id == request.Id);
+    var track = provider.Find(request.Id);
     if (track is null) return Results.NotFound(new { error = "Unknown track" });
     await engine.PlayAsync(track);
     return Results.Ok(engine.Status);
 });
 app.MapPost("/api/player/next", async (AudioEngine engine, IMusicProvider provider) =>
 {
+    if (engine.Current?.Provider == "youtube")
+        return Results.Conflict(new { error = "Для YouTube пока выбери следующий трек через поиск." });
     var tracks = provider.Search(null);
     var current = Array.FindIndex(tracks, t => t.Id == engine.Current?.Id);
     await engine.PlayAsync(tracks[(current + 1) % tracks.Length]);

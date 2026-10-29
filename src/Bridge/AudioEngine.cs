@@ -25,7 +25,8 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
         {
             lock (listenersLock) return new { state, ready = Ready, track = Current,
                 listeners = listeners.Count, bytesSentToHub = Interlocked.Read(ref bytes),
-                stream = "/stream.mp3", provider = "test", youtubeMusic = "not-configured" };
+                stream = "/stream.mp3", provider = Current?.Provider,
+                youtubeMusic = string.IsNullOrEmpty(config["YOUTUBE_PROVIDER_URL"]) ? "not-configured" : "enabled" };
         }
     }
 
@@ -40,6 +41,8 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
         await control.WaitAsync();
         try
         {
+            // Prepare/validate remote audio while the previous shared stream keeps playing.
+            var source = await provider.ResolveAudioAsync(track);
             await StopCoreAsync(false);
             state = "starting";
             Current = track;
@@ -48,10 +51,12 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
                 RedirectStandardOutput = true, RedirectStandardError = true,
                 UseShellExecute = false, CreateNoWindow = true
             };
-            string[] arguments = ["-hide_banner", "-loglevel", "warning", "-nostdin", "-re",
-                "-stream_loop", "-1", "-i", provider.ResolveAudio(track), "-vn", "-threads", "1",
+            List<string> arguments = ["-hide_banner", "-loglevel", "warning", "-nostdin", "-re"];
+            if (source.Loop) arguments.AddRange(["-stream_loop", "-1"]);
+            else arguments.AddRange(["-rw_timeout", "20000000"]);
+            arguments.AddRange(["-i", source.Location, "-vn", "-threads", "1",
                 "-c:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "2",
-                "-write_xing", "0", "-id3v2_version", "0", "-flush_packets", "1", "-f", "mp3", "pipe:1"];
+                "-write_xing", "0", "-id3v2_version", "0", "-flush_packets", "1", "-f", "mp3", "pipe:1"]);
             foreach (var argument in arguments) info.ArgumentList.Add(argument);
             process = Process.Start(info) ?? throw new InvalidOperationException("Cannot start FFmpeg");
             playback = new CancellationTokenSource();
@@ -59,6 +64,7 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
             Interlocked.Exchange(ref lastDataTicks, 0);
             pump = PumpAsync(process, playback.Token);
         }
+        catch (ProviderException) { throw; }
         catch
         {
             state = "error";
@@ -98,8 +104,8 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
             await encoder.WaitForExitAsync(token);
             if (!token.IsCancellationRequested)
             {
-                state = "error";
-                log.LogError("Encoder exited unexpectedly with code {Code}", encoder.ExitCode);
+                state = encoder.ExitCode == 0 ? "stopped" : "error";
+                if (encoder.ExitCode != 0) log.LogError("Encoder exited with code {Code}", encoder.ExitCode);
                 CompleteListeners();
             }
         }
