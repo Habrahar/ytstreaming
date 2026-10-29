@@ -81,7 +81,7 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
         }
     }
 
-    public async Task<NavigationPreview> PreviewAsync(long revision, long expectedVersion, CancellationToken token = default, bool deferUntilPlayback = false)
+    public async Task<NavigationPreview> PreviewAsync(long revision, long expectedVersion, CancellationToken token = default)
     {
         Track? seed;
         SelectionPlan? selectionPlan;
@@ -89,9 +89,6 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
         lock (gate)
         {
             CheckPreview(revision, expectedVersion);
-            // Passive previews from any phone must not start recommendations
-            // while another phone is still opening the selected audio.
-            if (deferUntilPlayback && !engine.BackgroundReady) throw new SelectionSupersededException();
             selectionPlan = plan;
             seed = history.LastOrDefault() ?? engine.Current;
             load = selectionPlan is null && seed?.Provider == "youtube" && engine.LatestRequestId is not null &&
@@ -108,7 +105,7 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
                     p.After(p.Position).ToArray(), p.At(p.Position))
                 : new(revision, version, history.Take(Math.Max(0, cursor)).Reverse().Take(64).ToArray(),
                     history.Skip(cursor + 1).Concat(upcoming).ToArray(), engine.Current);
-            if (pending is null && engine.Ready) preparer?.Schedule(preview.Next.FirstOrDefault(), () => engine.BackgroundReady);
+            if (pending is null && engine.Ready) preparer?.Schedule(preview.Next.FirstOrDefault(), () => engine.Ready);
         }
         return preview;
     }
@@ -312,7 +309,7 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
                 selectionPlan.RetryQueue = remaining.Take(12).ToArray();
                 if (navigationId is null) { upcoming.AddRange(remaining); plan = null; }
                 completed = true;
-                preparer?.Schedule(plan?.After(targetPosition).FirstOrDefault() ?? history.Skip(cursor + 1).Concat(upcoming).FirstOrDefault(), () => engine.BackgroundReady);
+                preparer?.Schedule(plan?.After(targetPosition).FirstOrDefault() ?? history.Skip(cursor + 1).Concat(upcoming).FirstOrDefault(), () => engine.Ready);
             }
         }
         catch (OperationCanceledException) when (own.IsCancellationRequested) { throw new SelectionSupersededException(); }

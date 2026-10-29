@@ -178,7 +178,7 @@ class ResumeCheck(unittest.TestCase):
             radio.assert_not_called()
             self.assertIn('=w96-h96',fetched[0])
             server.artwork('AAAAAAAAAAA')
-            radio.assert_not_called()
+            radio.assert_called_once()
             self.assertEqual(len(fetched),2)
             self.assertIn('=w544-h544',fetched[1])
 

@@ -33,10 +33,6 @@ if observe:
 else:
     seed=api('/api/youtube/search?q='+urllib.parse.quote(sys.argv[2]))[0] if len(sys.argv)>2 else library['tracks'][0]['track']
     status=play('/api/player/play',{'id':seed['id'],'requestId':'quality-cold'})
-    for _ in range(100):
-        if status.get('backgroundReady',True):break
-        time.sleep(.1); status=api('/api/status')
-    else:raise AssertionError('No-browser startup grace never released recommendations')
     preview=api('/api/player/neighbors?revision='+str(status['revision'])+'&version='+str(status['navigation']['version']))
     next_track=preview['next'][0]
     for _ in range(180):

@@ -5,32 +5,15 @@
   initial.parentElement.replaceChild(rail,initial); wrapper.append(initial); rail.append(wrapper);
   const cards=new Map([['empty',{node:wrapper,face:initial,image:initial.querySelector('img'),track:null,slot:0}]]);
   let currentId=null, view=[null,null,null,null,null], preview=null, previewKey='', requestKey='', request=null, retryAt=0;
-  let state=null, busy=false, gesture=null, suppressClickUntil=0, selectionId=null, foreground=false;
+  let state=null, busy=false, gesture=null, suppressClickUntil=0, selectionId=null;
   const q=selector=>document.querySelector(selector);
-  function cancelPreview() {request?.abort(); request=null; requestKey='';}
-  function cancelImages() {
-    for(const card of cards.values()) if(card.image.getAttribute('src') && card.loadedUrl!==card.image.getAttribute('src')) {
-      ++card.imageVersion; card.image.onload=null; card.image.onerror=null; card.image.removeAttribute('src');
-      card.face.classList.remove('has-art');
-    }
-  }
-  function loadImage(card,url) {
-    if(card.image.getAttribute('src')===url) return;
-    const version=card.imageVersion=(card.imageVersion||0)+1;
-    card.image.onload=()=>{
-      if(version!==card.imageVersion || card.image.getAttribute('src')!==url) return;
-      card.loadedUrl=url; card.face.classList.add('has-art');
-    };
-    card.image.onerror=()=>{if(version===card.imageVersion) card.face.classList.remove('has-art');};
-    card.image.src=url;
-  }
   function makeCard(track,key) {
     const node=document.createElement('div'); node.className='fan-item entering';
     node.dataset.trackId=track?.id||'';
     const face=document.createElement('button'); face.type='button'; face.className='cover fan-face';
     const record=document.createElement('div'); record.className='record'; record.setAttribute('aria-hidden','true');
     const image=document.createElement('img'); image.className='fan-art'; image.alt=''; image.decoding='async'; image.draggable=false;
-    image.referrerPolicy='no-referrer';
+    image.referrerPolicy='no-referrer'; image.onload=()=>face.classList.add('has-art'); image.onerror=()=>face.classList.remove('has-art');
     const caption=document.createElement('span'); caption.className='fan-caption'; caption.setAttribute('aria-hidden','true');
     const title=document.createElement('strong'), artist=document.createElement('small');
     title.textContent=track?.title||''; artist.textContent=track?.artist||''; caption.append(title,artist);
@@ -59,10 +42,10 @@
       }
       card.face.disabled=(busy && slot===0) || !item || Math.abs(slot)>1; card.face.tabIndex=card.face.disabled?-1:0;
       card.face.setAttribute('aria-label',item?(slot<0?'Предыдущая песня: ':slot>0?'Следующая песня: ':'Воспроизвести или приостановить: ')+item.title:'');
-      if(item && !foreground) {
+      if(item) {
         const url='/api/artwork/'+encodeURIComponent(item.id.slice(8))+(slot===0?'':'?size=card');
         card.image.fetchPriority=slot===0?'high':'low';
-        loadImage(card,url);
+        if(card.image.getAttribute('src')!==url) card.image.src=url;
       }
       if(card.node.classList.contains('entering')) {card.node.getBoundingClientRect(); card.node.classList.remove('entering');}
     });
@@ -79,23 +62,20 @@
     request?.abort(); const own=request=new AbortController(); requestKey=key;
     try {
       const value=await api('/api/player/neighbors?revision='+status.revision+'&version='+status.navigation.version,undefined,own.signal);
-      if(own!==request || foreground || currentId!==track.id || value.track?.id!==track.id) return;
+      if(own!==request || currentId!==track.id || value.track?.id!==track.id) return;
       preview=value; previewKey=key; retryAt=0; view=fromPreview(track,value); layout(track,view,false);
     } catch(error) {
       if(error.name!=='AbortError' && own===request) retryAt=error.status===409?0:Date.now()+10000;
     } finally {if(own===request) {requestKey=''; request=null;}}
   }
-  function sync(track,status,selection,foregroundPlayback=false) {
-    foreground=foregroundPlayback;
+  function sync(track,status,selection) {
     state=status; busy=!!selection || !!status?.navigation?.busy;
     if(selectionId!==(selection?.requestId||null)) {
-      selectionId=selection?.requestId||null; cancelPreview(); cancelImages();
+      selectionId=selection?.requestId||null; request?.abort(); request=null; requestKey='';
     }
-    if(foreground) {cancelPreview(); cancelImages();}
     if(track?.provider!=='youtube') track=null;
     if(selection && !selection.exact) {
-      // Retain known neighbors while a rapid manual jump has no exact target.
-      currentId=track?.id; view[2]=track;
+      currentId=track?.id; preview=null; previewKey=''; view=[null,null,track,null,null];
       layout(track,view,true); return;
     }
     if(currentId!==track?.id) {
@@ -112,11 +92,11 @@
         view=[null,selection && !selection.direction && actual?.id!==track?.id?actual:null,track,null,null]; preview=null;
       }
       view[2]=track; currentId=track?.id; previewKey=''; retryAt=0;
-      cancelPreview(); cancelImages();
+      request?.abort(); request=null; requestKey='';
     }
     layout(track,view,busy);
     const target=status?.navigation?.target||status?.track;
-    if(foreground || !track || !status || target?.id!==track.id || (selection && status.navigation?.requestId!==selection.requestId)) return;
+    if(!track || !status || target?.id!==track.id || (selection && status.navigation?.requestId!==selection.requestId)) return;
     const key=status.revision+':'+status.navigation.version;
     if(key!==previewKey && key!==requestKey && Date.now()>=retryAt) loadPreview(key,status,track);
   }

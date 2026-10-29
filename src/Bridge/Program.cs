@@ -78,14 +78,10 @@ app.MapGet("/listen.m3u", (HttpRequest request) => Results.Text(
 app.MapGet("/api/status", (AudioEngine engine, PlaybackNavigator navigator) => Results.Json(PlayerStatus(engine, navigator)));
 var startupMeasurements = new StartupMeasurements();
 app.MapGet("/api/player/startups", () => startupMeasurements.Snapshot);
-app.MapPost("/api/player/startups", (StartupSample sample, AudioEngine engine) =>
-{
-    if (!startupMeasurements.Add(sample)) return Results.BadRequest();
-    engine.ConfirmBrowserPlayback(sample.RequestId);
-    return (IResult)Results.NoContent();
-});
+app.MapPost("/api/player/startups", (StartupSample sample) =>
+    startupMeasurements.Add(sample) ? Results.NoContent() : Results.BadRequest());
 app.MapGet("/api/player/neighbors", (long revision, long version, PlaybackNavigator navigator, HttpContext context) =>
-    navigator.PreviewAsync(revision, version, context.RequestAborted, deferUntilPlayback: true));
+    navigator.PreviewAsync(revision, version, context.RequestAborted));
 app.MapGet("/api/tracks", (string? q, IMusicProvider provider) => provider.Search(q));
 app.MapGet("/api/youtube/search", (string q, YoutubeProvider youtube, HttpContext context) => youtube.SearchAsync(q, context.RequestAborted));
 Track? FindTrack(string? id, MusicCatalog catalog, PlaybackNavigator navigator, AudioEngine engine, MusicLibrary library) =>
