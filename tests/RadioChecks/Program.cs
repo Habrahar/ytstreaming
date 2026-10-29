@@ -49,6 +49,21 @@ try
     {
         await navigator.PlayAsync(source.Tracks[0], "radio-a");
         await Wait(() => player.Ready, "First track never became ready");
+        await Task.Delay(250);
+        Check(!player.BackgroundReady && source.RecommendationCalls == 0 && source.SecondCalls == 0,
+            "Recommendations or prefetch competed with the first browser startup");
+        var initialVersion = JsonSerializer.SerializeToElement(navigator.Status).GetProperty("version").GetInt64();
+        try
+        {
+            await navigator.PreviewAsync(player.Revision, initialVersion, deferUntilPlayback: true);
+            throw new Exception("A passive second phone fetched recommendations during startup");
+        }
+        catch (SelectionSupersededException) { }
+        Check(source.RecommendationCalls == 0, "A deferred preview still reached the catalog");
+        player.ConfirmBrowserPlayback("stale-request");
+        Check(!player.BackgroundReady, "A stale browser report unlocked the current selection");
+        player.ConfirmBrowserPlayback("radio-a");
+        Check(player.BackgroundReady, "Browser playing did not release background work");
         var revision = player.Revision; var generation = player.StreamGeneration; var clock = Stopwatch.StartNew();
         var listener = player.Subscribe(revision) ?? throw new Exception("Cannot subscribe");
         await Wait(() => player.Current == source.Tracks[1] && player.Ready, "Natural EOF did not advance without a browser");
@@ -70,6 +85,27 @@ try
         // All fixtures were played; the recommendation fallback can reuse B.
         await Wait(() => player.Current == source.Tracks[1] && player.Ready, "Radio depends on an open listener");
         Console.WriteLine("PASS: two natural EOF transitions, early preparation, one continuous AAC stream, real-time tail and no-browser advance");
+    });
+
+    await Scenario(async (source, player, navigator) =>
+    {
+        source.RepeatShortTracks = true;
+        await navigator.PlayAsync(source.Tracks[0], "short-no-browser");
+        await Wait(() => player.Ready, "Short no-browser stream never became ready");
+        var revision = player.Revision; var generation = player.StreamGeneration; var clock = Stopwatch.StartNew();
+        Check(!player.BackgroundReady && source.RecommendationCalls == 0 && source.SecondCalls == 0,
+            "Short no-browser stream prepared background work before its startup grace period");
+        // Every song is shorter than the fallback. The grace period belongs to
+        // the continuous stream, so repeated EOF transitions must not restart it.
+        await Wait(() => player.Revision >= revision + 3 && player.BackgroundReady,
+            "Short continuous tracks restarted the no-browser grace period forever");
+        Check(clock.Elapsed.TotalSeconds >= 4.5 && player.StreamGeneration == generation,
+            "No-browser fallback opened early or short compatible tracks replaced the stream");
+        await Wait(() => source.PreparedBeforeEnd && player.BackgroundReady,
+            "No-browser fallback did not release source preparation during a short track");
+        Check(source.RecommendationCalls >= 2 && JsonSerializer.SerializeToElement(player.Status).GetProperty("listeners").GetInt32() == 0,
+            "Repeated short-track fallback required a listener or skipped radio transitions");
+        Console.WriteLine("PASS: repeated short compatible tracks share one startup grace period and prepare radio without a browser or listener");
     });
 
     await Scenario(async (source, player, navigator) =>
@@ -146,8 +182,8 @@ static JsonElement Radio(PlaybackNavigator navigator) => JsonSerializer.Serializ
 sealed class FixtureSource(string directory) : IMusicProvider, ITrackRecommendations
 {
     public Track[] Tracks { get; } = [new("youtube:AAAAAAAAAAA", "A", "Fixture", "youtube"), new("youtube:BBBBBBBBBBB", "B", "Fixture", "youtube"), new("youtube:CCCCCCCCCCC", "C", "Fixture", "youtube")];
-    public bool BlockSecond, FailSecond, SecondIsWave, BrokenFirst, PreparedBeforeEnd;
-    public int SecondCalls;
+    public bool BlockSecond, FailSecond, SecondIsWave, BrokenFirst, PreparedBeforeEnd, RepeatShortTracks;
+    public int SecondCalls, RecommendationCalls;
     public Func<bool> IsFirstPlaying = () => false;
     public TaskCompletionSource Release = new(TaskCreationOptions.RunContinuationsAsynchronously);
     public Track[] Search(string? query) => Tracks;
@@ -161,9 +197,15 @@ sealed class FixtureSource(string directory) : IMusicProvider, ITrackRecommendat
             if (FailSecond) throw new ProviderException("Unavailable fixture");
         }
         var wave = track == Tracks[1] && SecondIsWave;
-        var file = track == Tracks[0] ? BrokenFirst ? "broken.m4a" : "short.m4a" : wave ? "long.wav" : "long.m4a";
+        var file = track == Tracks[0] ? BrokenFirst ? "broken.m4a" : "short.m4a" : wave ? "long.wav" : RepeatShortTracks ? "short.m4a" : "long.m4a";
         return new(Path.Combine(directory, file), false, Codec: wave ? null : "mp4a.40.2", BitrateKbps:128, SampleRate:44100, Channels:2);
     }
-    public Task<Track[]> RelatedAsync(Track track, CancellationToken cancellationToken = default) =>
-        Task.FromResult(Tracks.Skip(Array.IndexOf(Tracks, track) + 1).ToArray());
+    public Task<Track[]> RelatedAsync(Track track, CancellationToken cancellationToken = default)
+    {
+        Interlocked.Increment(ref RecommendationCalls);
+        var position = Array.IndexOf(Tracks, track);
+        var following = Tracks.Skip(position + 1);
+        if (RepeatShortTracks) following = following.Concat(Tracks.Take(position));
+        return Task.FromResult(following.ToArray());
+    }
 }

@@ -103,11 +103,7 @@ def artwork(video_id, preview=False, thumbnail=None, preview_size=96):
         if cached:
             artwork_cache.move_to_end(key)
             return cached
-    # Watch metadata includes the album art at up to 544px, unlike the 120px
-    # preview returned by search. Reuse this request later for the Next button.
-    if not preview:
-        try: radio(video_id)
-        except Exception: pass
+    # Artwork uses known catalog thumbnails; it never starts recommendations.
     with cache_lock:
         track = track_cache.get(video_id)
     url = (track or {}).get('thumbnail') or thumbnail or ''
@@ -116,8 +112,9 @@ def artwork(video_id, preview=False, thumbnail=None, preview_size=96):
     host = urlparse(url).hostname or ''
     if not url.startswith('https://') or not (host == 'i.ytimg.com' or host.endswith('.googleusercontent.com')):
         raise ValueError('No supported artwork')
-    if preview and host.endswith('.googleusercontent.com'):
-        url = re.sub(r'=w\d+-h\d+', f'=w{preview_size}-h{preview_size}', url)
+    if host.endswith('.googleusercontent.com'):
+        size = preview_size if preview else 544
+        url = re.sub(r'=w\d+-h\d+', f'=w{size}-h{size}', url)
     with NetworkSession() as session:
         with session.get(url, stream=True, allow_redirects=False) as response:
             response.raise_for_status()

@@ -17,9 +17,9 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     private long naturallyEndedRevision = -1;
     private volatile bool radioEnabled;
     private int? sourceSampleRate, sourceChannels;
-    private Track? pending;
+    private volatile Track? pending;
     private string? latestRequestId;
-    private string? activeRequestId;
+    private volatile string? activeRequestId;
     private string? failedRequestId;
     private string? lastError;
     private long resolveMilliseconds;
@@ -42,6 +42,8 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     private Task? pump;
     private long bytes;
     private long lastDataTicks;
+    private long firstDataTicks;
+    private long browserStartedGeneration = -1;
     private double StartupSeconds { get; } = int.TryParse(config["AUDIO_STARTUP_SECONDS"], out var burst) && burst is >= 3 and <= 8 ? burst : 3;
     private volatile string state = "stopped";
     public Track? Current { get; private set; }
@@ -56,11 +58,30 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     public string? FailedRequestId => failedRequestId;
     public bool Ready => state == "playing" &&
         DateTime.UtcNow.Ticks - Interlocked.Read(ref lastDataTicks) < TimeSpan.FromSeconds(nativeCopy ? StartupSeconds + 2 : 5).Ticks;
+    // A first AAC packet is not proof that Safari has started. Give the selected
+    // stream priority until the browser confirms playing, with a bounded fallback
+    // for old clients and radio running without an open phone.
+    public bool BackgroundReady
+    {
+        get
+        {
+            var first = Interlocked.Read(ref firstDataTicks);
+            return pending is null && Ready && first != 0 &&
+                (Interlocked.Read(ref browserStartedGeneration) == StreamGeneration ||
+                 Stopwatch.GetElapsedTime(first) >= TimeSpan.FromSeconds(5));
+        }
+    }
+    public void ConfirmBrowserPlayback(string requestId)
+    {
+        var generation = StreamGeneration;
+        if (Ready && activeRequestId == requestId)
+            Interlocked.Exchange(ref browserStartedGeneration, generation);
+    }
     public object Status
     {
         get
         {
-            lock (listenersLock) return new { state, ready = Ready, track = Current, pending,
+            lock (listenersLock) return new { state, ready = Ready, backgroundReady = BackgroundReady, track = Current, pending,
                 revision = Revision, streamGeneration = StreamGeneration,
                 naturallyEndedRevision = NaturallyEndedRevision, requestId = activeRequestId, latestRequestId, error = lastError,
                 resolveMilliseconds, startupMilliseconds,
@@ -134,6 +155,7 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
             Interlocked.Exchange(ref aheadBytes, 0); Interlocked.Exchange(ref maxGapMilliseconds, 0); Interlocked.Exchange(ref slowDisconnects, 0);
             lock (listenersLock) { replay.Clear(); replayBytes = 0; replaySeconds = 0; }
             startupMilliseconds = 0;
+            if (!continuous) Interlocked.Exchange(ref firstDataTicks, 0);
             startedAtTicks = Stopwatch.GetTimestamp();
             var info = new ProcessStartInfo(config["FFMPEG_PATH"] ?? "ffmpeg")
             {
@@ -188,7 +210,11 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     {
         var now = DateTime.UtcNow.Ticks;
         var previous = Interlocked.Read(ref lastDataTicks);
-        if (Interlocked.Read(ref bytes) == 0) startupMilliseconds = (long)Stopwatch.GetElapsedTime(startedAtTicks).TotalMilliseconds;
+        if (Interlocked.Read(ref bytes) == 0)
+        {
+            startupMilliseconds = (long)Stopwatch.GetElapsedTime(startedAtTicks).TotalMilliseconds;
+            Interlocked.CompareExchange(ref firstDataTicks, Stopwatch.GetTimestamp(), 0);
+        }
         else if (previous > 0)
         {
             var gap = (now - previous) / TimeSpan.TicksPerMillisecond;

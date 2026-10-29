@@ -9,8 +9,13 @@ function environment({unsupported=null,noSession=false,rejectLive=false}={}) {
   let timerId=0;
   let metadataCount=0;
   function element(selector) {
-    if(!elements.has(selector)) elements.set(selector,{value:'',classList:{add(){},remove(){},toggle(){}},dataset:{},
-      setAttribute(){},removeAttribute(){},replaceChildren(){},blur(){},focus(){}});
+    if(!elements.has(selector)) {
+      const attributes=new Map(), node={value:'',classList:{add(){},remove(){},toggle(){}},dataset:{},complete:false,
+        setAttribute:(name,value)=>attributes.set(name,String(value)),getAttribute:name=>attributes.get(name)??null,
+        removeAttribute:name=>attributes.delete(name),replaceChildren(){},blur(){},focus(){}};
+      Object.defineProperty(node,'src',{get:()=>attributes.get('src')??'',set:value=>attributes.set('src',value)});
+      elements.set(selector,node);
+    }
     return elements.get(selector);
   }
   const audio=element('#audio'); audio.paused=true; audio.playCalls=0;
@@ -107,12 +112,39 @@ console.log('PASS: partial/missing Media Session support does not stop playback 
   assert.equal(rapid.elements.get('#title').textContent,'Last choice','Late response replaced the last selected song');
   console.log('PASS: 20 Next and 6 Previous before loading, cumulative target and late-response rejection');
   const priority=environment(); vm.runInContext('server=fixture;',priority.context);
-  priority.context.window.coverFan={canPrevious(){return false;},sync(){priority.requests.push({url:'cover-work',playCalls:priority.audio.playCalls});}};
+  priority.context.window.coverFan={canPrevious(){return false;},sync(track,status,selection,foreground){priority.requests.push({url:'cover-work',playCalls:priority.audio.playCalls,foreground});}};
   vm.runInContext('choose(fixture.track)',priority.context);
   assert.ok(priority.requests.findIndex(r=>r.url==='/api/player/play')<priority.requests.findIndex(r=>r.url==='cover-work'),
     'Cover requests were scheduled before the playback command');
   assert.ok(priority.requests.find(r=>r.url==='cover-work').playCalls>0,'Cover work preceded audio activation');
-  console.log('PASS: playback command and audio activation precede cover work');
+  assert.equal(priority.requests.find(r=>r.url==='cover-work').foreground,true,'Preparation did not defer fan work');
+  assert.equal(priority.session.metadata.artwork.length,0,'Native artwork URL was exposed before audio played');
+  const priorityId=JSON.parse(priority.requests.find(r=>r.url==='/api/player/play').options.body).requestId;
+  priority.reply(priorityId,priority.context.fixture);
+  for(let i=0;i<20;i++) await Promise.resolve();
+  assert.equal(priority.requests.filter(r=>r.url==='cover-work').at(-1).foreground,true,'Command completion released artwork before audio played');
+  assert.equal(priority.session.metadata.artwork.length,0);
+  priority.audio.onplaying();
+  assert.equal(priority.requests.filter(r=>r.url==='cover-work').at(-1).foreground,false,'Real playing did not release fan work');
+  assert.equal(priority.session.metadata.artwork[0].src,'http://127.0.0.1:8090/api/artwork/AAAAAAAAAAA');
+  const playingMetadata=priority.session.metadata;
+  priority.audio.onwaiting();
+  assert.equal(priority.requests.filter(r=>r.url==='cover-work').at(-1).foreground,true,'Buffering did not defer optional work');
+  assert.equal(priority.session.metadata,playingMetadata,'Buffering discarded previously published artwork');
+  priority.handlers.get('pause')();
+  assert.equal(priority.requests.filter(r=>r.url==='cover-work').at(-1).foreground,false,'Local pause indefinitely deferred metadata');
+  console.log('PASS: preparation and buffering defer fan/native artwork until playing; local pause retains metadata');
+  const fallback=environment(); vm.runInContext('server=fixture; choose(fixture.track);',fallback.context);
+  assert.equal(fallback.elements.get('#artwork').getAttribute('src'),null,'Fallback cover started before audio played');
+  fallback.audio.onplaying();
+  assert.equal(fallback.elements.get('#artwork').getAttribute('src'),'/api/artwork/AAAAAAAAAAA','Fallback cover did not resume after playing');
+  vm.runInContext('choose({...fixture.track,id:"youtube:BBBBBBBBBBB"});',fallback.context);
+  assert.equal(fallback.elements.get('#artwork').getAttribute('src'),null,'New selection retained an in-flight fallback cover');
+  assert.equal(fallback.session.metadata.artwork.length,0,'New selection published a new native cover early');
+  fallback.handlers.get('pause')();
+  assert.equal(fallback.elements.get('#artwork').getAttribute('src'),'/api/artwork/BBBBBBBBBBB');
+  assert.equal(fallback.session.metadata.artwork.length,1,'Paused selection could not display native metadata');
+  console.log('PASS: fallback cover follows playback priority and a paused selection can display artwork');
   const measured=environment(); measured.context.testNow=10000;
   vm.runInContext('Date.now=()=>testNow; server=fixture; choose(fixture.track);',measured.context);
   const measuredCommand=measured.requests.find(r=>r.url==='/api/player/play');

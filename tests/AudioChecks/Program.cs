@@ -136,6 +136,11 @@ if (args.Contains("--ffmpeg"))
         for (var i = 0; !player.Ready && i < 100; i++) await Task.Delay(30);
         Check(player.Ready, "AAC copy never became ready");
         await Task.Delay(400);
+        Check(!player.BackgroundReady, "Background preparation started at the first packet");
+        player.ConfirmBrowserPlayback("old-request");
+        Check(!player.BackgroundReady, "Old browser confirmation released a new selection");
+        player.ConfirmBrowserPlayback("native-fixture");
+        Check(player.BackgroundReady, "Actual browser start did not release background work");
         var listener = player.Subscribe(player.Revision) ?? throw new Exception("Cannot subscribe to native AAC");
         Check(listener.ContentType == "audio/aac", "Native stream advertised as MP3");
         var burst = 0;
@@ -143,7 +148,15 @@ if (args.Contains("--ffmpeg"))
         Check(burst >= 2, "New listener did not get the warm replay buffer");
         var state = JsonSerializer.SerializeToElement(player.Status);
         Check(state.GetProperty("outputMode").GetString() == "copy" && state.GetProperty("outputCodec").GetString() == "aac", "AAC was re-encoded");
+        await player.PlayAsync(track, "new-native-fixture");
+        for (var i = 0; !player.Ready && i < 100; i++) await Task.Delay(30);
+        Check(player.Ready && !player.BackgroundReady, "Manual selection inherited the previous startup confirmation");
+        player.ConfirmBrowserPlayback("native-fixture");
+        Check(!player.BackgroundReady, "Late playing report unlocked a later selection");
+        await Task.Delay(5150);
+        Check(player.BackgroundReady, "A client without timing reports could never prepare radio");
         await player.StopPlaybackAsync();
+        Check(!player.BackgroundReady, "Stop left background preparation unlocked");
         while (listener.Reader.TryRead(out _)) { }
         await listener.Reader.Completion.WaitAsync(TimeSpan.FromSeconds(3));
         Console.WriteLine("PASS: real FFmpeg AAC passthrough, correct MIME, frame-aligned replay burst and Stop");

@@ -5,7 +5,7 @@ let attachedStreamGeneration = -1;
 let wantsAudio = false, phase = 'idle', controlRequest = null, refreshing = false, connectionSequence = 0;
 let searchRequest = null, searchSequence = 0, searchTimer, intentionalReset = false;
 let completedSearch = '';
-let artworkTrack = null;
+let artworkTrack = null, mediaArtworkTrack = null, mediaArtworkUrl = null;
 let reconnectTimer=null, reconnectAttempts=0;
 const clientId=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);
 let navigationBurst=null;
@@ -34,12 +34,20 @@ function render() {
   $('#artist').textContent = isMusic ? track.artist : 'Начни с поиска наверху';
   $('#duration').textContent = isMusic ? track.duration || '' : '';
   const artworkUrl = isMusic ? '/api/artwork/' + encodeURIComponent(track.id.slice(8)) : null;
-  if (window.coverFan) window.coverFan.sync(track,server,pending);
-  else if (artworkTrack !== track?.id) {
-    artworkTrack = track?.id;
-    $('#cover').classList.remove('has-art');
-    if (artworkUrl) { $('#artwork').src=artworkUrl; $('#artwork').alt='Обложка: '+track.title; }
-    else $('#artwork').removeAttribute('src');
+  // Optional artwork and recommendations wait for audible playback. A local
+  // pause releases this priority so a paused phone can still display covers.
+  const foreground = phase === 'buffering' || (!!pending && wantsAudio && phase !== 'playing');
+  if (window.coverFan) window.coverFan.sync(track,server,pending,foreground);
+  else {
+    const image=$('#artwork');
+    if (artworkTrack !== track?.id) {
+      artworkTrack = track?.id;
+      $('#cover').classList.remove('has-art'); image.removeAttribute('src');
+    }
+    if(foreground) { if(!image.complete) image.removeAttribute('src'); }
+    else if(artworkUrl && image.getAttribute('src')!==artworkUrl) {
+      image.src=artworkUrl; image.alt='Обложка: '+track.title;
+    }
   }
   const status = pending ? (pending.direction ? 'Готовим '+(pending.direction==='next'?'следующую':'предыдущую')+' песню…' : 'Готовим выбранную песню…') : ({idle:isMusic?'Нажми ▶, чтобы слушать':'Выбери песню', buffering:'Подключаем звук…',
     playing:'Сейчас играет', paused:'На паузе', ended:'Трек закончился', gesture:'Нажми ▶, чтобы включить звук',
@@ -55,7 +63,9 @@ function render() {
   $('#cover').classList.toggle('spinning', phase === 'playing' && !pending);
   const mediaState=!isMusic || phase==='idle'?'none':
     wantsAudio && !['error','gesture','ended'].includes(phase)?'playing':'paused';
-  mediaControls.update(track,artworkUrl?new URL(artworkUrl,location.href).href:null,mediaState);
+  if(mediaArtworkTrack!==track?.id) {mediaArtworkTrack=track?.id; mediaArtworkUrl=null;}
+  if(!foreground) mediaArtworkUrl=artworkUrl?new URL(artworkUrl,location.href).href:null;
+  mediaControls.update(track,mediaArtworkUrl,mediaState);
   window.libraryUI?.renderCurrent(track);
 }
 

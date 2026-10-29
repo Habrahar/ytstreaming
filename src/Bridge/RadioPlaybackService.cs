@@ -31,7 +31,7 @@ public sealed class RadioPlaybackService(AudioEngine engine, PlaybackNavigator n
                     preparationCancellation?.Dispose(); preparationCancellation = null;
                     retryAfter = DateTime.UtcNow.AddSeconds(10);
                 }
-                if (engine.Ready && !prepared && preparation is null && DateTime.UtcNow >= retryAfter)
+                if (engine.BackgroundReady && !prepared && preparation is null && DateTime.UtcNow >= retryAfter)
                 {
                     preparationCancellation = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
                     preparation = PrepareAsync(revision, preparationCancellation.Token);

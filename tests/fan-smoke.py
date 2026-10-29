@@ -35,6 +35,12 @@ def playable(path, body, track_id):
 
 
 def preview(status):
+    revision=status['revision']
+    for _ in range(100):
+        if status.get('backgroundReady',True):break
+        time.sleep(.1); status=api('/api/status')
+        assert status['revision']==revision,'Track changed before its preview was ready'
+    else:raise AssertionError('Startup grace never released the preview')
     return api('/api/player/neighbors?revision=' + str(status['revision']) + '&version=' + str(status['navigation']['version']))
 
 
