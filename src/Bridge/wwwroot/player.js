@@ -1,6 +1,7 @@
 const $ = selector => document.querySelector(selector);
 const audio = $('#audio');
 let server = null, pending = null, selectionSequence = 0, attachedRevision = -1;
+let attachedStreamGeneration = -1;
 let wantsAudio = false, phase = 'idle', controlRequest = null, refreshing = false, connectionSequence = 0;
 let searchRequest = null, searchSequence = 0, searchTimer, intentionalReset = false;
 let completedSearch = '';
@@ -96,12 +97,14 @@ function startSelection(track, path, body, direction = null, exact = true) {
   pending = {track, requestId, direction, exact};
   wantsAudio = true;
   attachedRevision = -1;
+  attachedStreamGeneration = -1;
   notice(); closeSearch(); render();
   const command = api(path, {...body, requestId, clientId, commandSequence:sequence}, controlRequest.signal);
   const playing = connect('requestId=' + encodeURIComponent(requestId));
   Promise.all([command, playing]).then(([status]) => {
     if (sequence !== selectionSequence) return;
-    server = status; attachedRevision = status.revision; pending = null; navigationBurst=null;
+    server = status; attachedRevision = status.revision; attachedStreamGeneration=status.streamGeneration;
+    pending = null; navigationBurst=null;
     if(wantsAudio && phase==='error' && status.ready) reconnect();
     render();
   }).catch(error => {
@@ -153,6 +156,7 @@ function resumePlayback() {
   wantsAudio = true;
   if (server.ready) {
     attachedRevision = server.revision;
+    attachedStreamGeneration = server.streamGeneration;
     connect('revision=' + server.revision);
   } else choose(server.track);
 }
@@ -172,8 +176,14 @@ async function refresh() {
     if(pending && status.navigation?.requestId===pending.requestId && status.navigation.target)
       {pending.track=status.navigation.target; pending.exact=true;}
     if (!pending && wantsAudio && server.ready && attachedRevision !== server.revision) {
+      const sameStream=Number.isFinite(server.streamGeneration) && attachedStreamGeneration===server.streamGeneration &&
+        audio.src && !audio.ended && !audio.error;
       attachedRevision = server.revision;
-      connect('revision=' + server.revision);
+      attachedStreamGeneration = server.streamGeneration;
+      if(!sameStream) connect('revision=' + server.revision);
+    }
+    if(!pending && !server.ready && server.navigation?.radio?.error) {
+      phase='error'; wantsAudio=false; notice(server.navigation.radio.error);
     }
     if (!pending && !server.ready && server.state === 'error') {
       phase = 'error'; notice('Источник прервал звук. Нажми ▶ для повторного запуска.');
@@ -260,12 +270,13 @@ audio.onended=async()=>{
     if(sequence!==selectionSequence || pending || !wantsAudio) return;
     server=status;
     if(status.ready && attachedRevision!==status.revision) {
-      attachedRevision=status.revision; connect('revision='+status.revision); return;
+      attachedRevision=status.revision; attachedStreamGeneration=status.streamGeneration; connect('revision='+status.revision); return;
     }
     if(status.ready) {reconnect(); return;}
     // A different phone may be changing the common stream. Follow its new
     // revision when ready instead of treating the closed old response as EOF.
-    if(status.pending || status.state==='starting') return;
+    if(status.pending || status.navigation?.busy || status.state==='starting') return;
+    if(status.navigation?.radio?.error) {phase='error'; wantsAudio=false; notice(status.navigation.radio.error); render(); return;}
     phase='ended'; wantsAudio=false; render();
   } catch { phase='error'; notice('Связь прервалась. Нажми ▶ для подключения.'); render(); }
 };
@@ -281,8 +292,8 @@ function reconnect() {
       const status=await api('/api/status');
       if(sequence!==selectionSequence || pending || !wantsAudio) return;
       server=status;
-      if(status.ready) {attachedRevision=status.revision; connect('revision='+status.revision);}
-      else if(status.pending || status.state==='starting') reconnect();
+      if(status.ready) {attachedRevision=status.revision; attachedStreamGeneration=status.streamGeneration; connect('revision='+status.revision);}
+      else if(status.pending || status.navigation?.busy || status.state==='starting') reconnect();
       else {wantsAudio=false; phase=status.state==='error'?'error':'ended'; render();}
     } catch {reconnect();}
   },delay);

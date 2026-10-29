@@ -13,6 +13,7 @@ builder.Services.AddSingleton<PlaybackNavigator>();
 builder.Services.AddSingleton<NextTrackPreparer>();
 builder.Services.AddSingleton<MusicLibrary>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AudioEngine>());
+builder.Services.AddHostedService<RadioPlaybackService>();
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 4096);
 var app = builder.Build();
 var musicLibrary = app.Services.GetRequiredService<MusicLibrary>();

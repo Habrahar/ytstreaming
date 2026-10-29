@@ -45,7 +45,7 @@ Console.WriteLine("PASS: AAC bytes preserved across split reads, valid frame bou
 var clock = Stopwatch.StartNew(); var sent = new List<byte[]>();
 await NativeAacPump.RunAsync(new MemoryStream(Frames(200)), packet => sent.Add(packet.Bytes), _ => { }, CancellationToken.None);
 Check(sent.SelectMany(b => b).SequenceEqual(Frames(200)), "Paced output changed AAC bytes");
-Check(clock.Elapsed.TotalSeconds >= 1.5 && clock.Elapsed.TotalSeconds < 5, "Output was not paced after the initial burst");
+Check(clock.Elapsed.TotalSeconds >= 4.5 && clock.Elapsed.TotalSeconds < 6, "EOF did not wait for the initial audio burst to play out");
 long buffered = 0, maximum = 0;
 using (var stop = new CancellationTokenSource())
 {
@@ -60,7 +60,7 @@ using (var stop = new CancellationTokenSource())
     catch (OperationCanceledException) { }
 }
 Check(maximum <= 2 * 1024 * 1024 + 4096 && maximum >= 2 * 1024 * 1024, "Read-ahead is not bounded to 2 MiB");
-Console.WriteLine("PASS: initial burst, real-time pacing, bounded compressed reserve and prompt cancellation");
+Console.WriteLine("PASS: initial burst, real-time pacing through EOF, bounded compressed reserve and prompt cancellation");
 
 var handler = new DelayedHandler();
 var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["YOUTUBE_PROVIDER_URL"] = "http://fixture" }).Build();

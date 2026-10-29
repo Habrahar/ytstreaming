@@ -122,4 +122,31 @@ console.log('PASS: partial/missing Media Session support does not stop playback 
   network.responses.set('/api/status',{...network.context.fixture,ready:false,state:'stopped'});
   await network.audio.onended(); assert.equal(network.timers.size,0,'Real end-of-song incorrectly reconnected');
   console.log('PASS: transient disconnect recovery, bounded retries, pause cancels recovery and real EOF stays ended');
+
+  const radio=environment(); radio.context.fixture.streamGeneration=1;
+  vm.runInContext('server=fixture;',radio.context); radio.handlers.get('play')(); radio.audio.onplaying();
+  async function poll(status) {
+    radio.responses.set('/api/status',status);
+    vm.runInContext('refreshing=false;',radio.context);
+    await vm.runInContext('refresh()',radio.context);
+  }
+  for(const revision of [8,9]) await poll({...radio.context.fixture,revision,
+    track:{...radio.context.fixture.track,title:'Radio '+revision}});
+  assert.equal(radio.audio.playCalls,1,'Automatic track change restarted the continuous audio element');
+  assert.equal(radio.elements.get('#title').textContent,'Radio 9');
+  assert.equal(radio.requests.filter(r=>r.url==='/api/player/next').length,0,'A phone sent its own automatic Next');
+  radio.handlers.get('pause')(); await poll({...radio.context.fixture,revision:10});
+  assert.equal(radio.audio.playCalls,1,'Radio restarted locally paused playback');
+  radio.handlers.get('play')(); assert.equal(radio.audio.playCalls,2);
+  await poll({...radio.context.fixture,revision:11,streamGeneration:2});
+  assert.equal(radio.audio.playCalls,3,'A changed stream format was not reconnected');
+  const gap={...radio.context.fixture,revision:11,streamGeneration:2,ready:false,state:'stopped',
+    navigation:{busy:true,radio:{enabled:true,advancing:true}}};
+  radio.responses.set('/api/status',gap); await radio.audio.onended();
+  assert.equal(vm.runInContext('wantsAudio',radio.context),true,'Waiting for server radio was treated as final EOF');
+  const failure={...gap,navigation:{busy:false,radio:{enabled:true,advancing:false,error:'Radio unavailable'}}};
+  await poll(failure);
+  assert.equal(radio.elements.get('#message').textContent,'Radio unavailable');
+  assert.equal(vm.runInContext('wantsAudio',radio.context),false,'Failed radio kept reconnecting');
+  console.log('PASS: server-only radio, continuous stream across tracks, paused-device safety, codec reconnect and radio errors');
 })().catch(error=>{console.error(error);process.exitCode=1;});

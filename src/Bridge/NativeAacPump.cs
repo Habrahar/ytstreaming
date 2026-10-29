@@ -49,6 +49,10 @@ public static class NativeAacPump
                 foreach (var packet in packets.Append(chunk)) await SendAsync(packet);
             }
             if (packets.Finish() is { } final) await SendAsync(final);
+            // The initial decoder burst is ahead of wall time. Let its tail play
+            // before EOF starts another song, or each radio track would add lead.
+            var tail = emitted - clock.Elapsed.TotalSeconds;
+            if (tail > 0) await Task.Delay(TimeSpan.FromSeconds(tail), token);
         }
         finally { inputCancellation.Cancel(); await producer; }
     }

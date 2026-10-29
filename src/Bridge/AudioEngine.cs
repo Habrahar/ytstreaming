@@ -13,6 +13,10 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     private CancellationTokenSource? selection;
     private long selectionVersion;
     private long revision;
+    private long streamGeneration;
+    private long naturallyEndedRevision = -1;
+    private volatile bool radioEnabled;
+    private int? sourceSampleRate, sourceChannels;
     private Track? pending;
     private string? latestRequestId;
     private string? activeRequestId;
@@ -43,6 +47,9 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     public string State => state;
     public string ContentType { get; private set; } = "audio/mpeg";
     public long Revision => Interlocked.Read(ref revision);
+    public long StreamGeneration => Interlocked.Read(ref streamGeneration);
+    public long NaturallyEndedRevision => Interlocked.Read(ref naturallyEndedRevision);
+    public bool RadioEnabled { get => radioEnabled; set => radioEnabled = value; }
     public string? ActiveRequestId => activeRequestId;
     public string? LatestRequestId => latestRequestId;
     public string? FailedRequestId => failedRequestId;
@@ -53,7 +60,8 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
         get
         {
             lock (listenersLock) return new { state, ready = Ready, track = Current, pending,
-                revision = Revision, requestId = activeRequestId, latestRequestId, error = lastError,
+                revision = Revision, streamGeneration = StreamGeneration,
+                naturallyEndedRevision = NaturallyEndedRevision, requestId = activeRequestId, latestRequestId, error = lastError,
                 resolveMilliseconds, startupMilliseconds,
                 sourceStrategy, sourceExtractMilliseconds, sourceProbeMilliseconds,
                 sourceBitrateKbps, outputCodec, outputMode = nativeCopy ? "copy" : "encode", contentType = ContentType,
@@ -71,7 +79,7 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     }
     public async Task StopAsync(CancellationToken cancellationToken) => await StopPlaybackAsync();
 
-    public async Task PlayAsync(Track track, string? requestId = null, CancellationToken cancellationToken = default)
+    public async Task PlayAsync(Track track, string? requestId = null, CancellationToken cancellationToken = default, long? automaticFromRevision = null)
     {
         CancellationTokenSource ownSelection;
         long version;
@@ -98,22 +106,30 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
             await control.WaitAsync(token);
             entered = true;
             token.ThrowIfCancellationRequested();
-            // Never mix tracks in an existing MP3 response: browsers retain old audio.
-            await StopCoreAsync(true);
+            var copy = !source.Loop && config["AUDIO_PASSTHROUGH"] != "false" &&
+                (source.Codec?.StartsWith("mp4a.", StringComparison.Ordinal) == true || source.Codec == "aac");
+            var contentType = copy ? "audio/aac" : "audio/mpeg";
+            // Only a natural radio transition may append to existing responses.
+            // Manual selections still close them to discard the phone's old buffer.
+            var continuous = automaticFromRevision == Revision && NaturallyEndedRevision == Revision && radioEnabled &&
+                ContentType == contentType && (!copy || source.SampleRate is > 0 && source.Channels is > 0 &&
+                    source.SampleRate == sourceSampleRate && source.Channels == sourceChannels);
+            await StopCoreAsync(!continuous);
             token.ThrowIfCancellationRequested();
             state = "starting";
             Current = track;
             activeRequestId = requestId;
             Interlocked.Increment(ref revision);
+            if (!continuous) Interlocked.Increment(ref streamGeneration);
             resolveMilliseconds = watch.ElapsedMilliseconds;
             sourceStrategy = source.Strategy;
             sourceExtractMilliseconds = source.ExtractMilliseconds;
             sourceProbeMilliseconds = source.ProbeMilliseconds;
             sourceBitrateKbps = source.BitrateKbps;
-            nativeCopy = !source.Loop && config["AUDIO_PASSTHROUGH"] != "false" &&
-                (source.Codec?.StartsWith("mp4a.", StringComparison.Ordinal) == true || source.Codec == "aac");
+            nativeCopy = copy;
+            sourceSampleRate = source.SampleRate; sourceChannels = source.Channels;
             outputCodec = nativeCopy ? "aac" : "mp3";
-            ContentType = nativeCopy ? "audio/aac" : "audio/mpeg";
+            ContentType = contentType;
             Interlocked.Exchange(ref aheadBytes, 0); Interlocked.Exchange(ref maxGapMilliseconds, 0); Interlocked.Exchange(ref slowDisconnects, 0);
             lock (listenersLock) { replay.Clear(); replayBytes = 0; replaySeconds = 0; }
             startupMilliseconds = 0;
@@ -213,9 +229,13 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
             await encoder.WaitForExitAsync(token);
             if (!token.IsCancellationRequested)
             {
-                state = encoder.ExitCode == 0 ? "stopped" : "error";
+                var natural = encoder.ExitCode == 0 && Interlocked.Read(ref bytes) > 0;
+                state = natural ? "stopped" : "error";
                 if (encoder.ExitCode != 0) log.LogError("Encoder exited with code {Code}", encoder.ExitCode);
-                CompleteListeners();
+                else if (!natural) log.LogError("Encoder produced no audio");
+                if (natural)
+                    Interlocked.Exchange(ref naturallyEndedRevision, Revision);
+                if (!natural || !radioEnabled || Current?.Provider != "youtube") CompleteListeners();
             }
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
@@ -266,6 +286,11 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
             listeners.Clear();
         }
     }
+    public void ReleaseEndedStream(long expectedRevision)
+    {
+        lock (listenersLock)
+            if (Revision == expectedRevision && NaturallyEndedRevision == expectedRevision) CompleteListeners();
+    }
     public async Task StopPlaybackAsync()
     {
         lock (selectionLock)
@@ -281,6 +306,7 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     }
     private async Task StopCoreAsync(bool disconnect)
     {
+        Interlocked.Exchange(ref naturallyEndedRevision, -1);
         playback?.Cancel();
         if (process is { HasExited: false }) process.Kill(entireProcessTree: true);
         if (pump is not null) await pump;

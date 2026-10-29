@@ -12,6 +12,8 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
     private long version;
     private CancellationTokenSource? pending;
     private string? pendingRequestId;
+    private bool automaticPending;
+    private string? radioError;
     private SelectionPlan? plan;
     private readonly Dictionary<string, (long Sequence, long Order)> clients = new();
     private long commandOrder;
@@ -39,7 +41,8 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
             lock (gate) return new { canPrevious = plan is { } p ? p.Position > p.Start : cursor > 0,
                 canNext = (plan?.At(plan.Position) ?? engine.Current)?.Provider == "youtube", position = cursor, count = history.Count,
                 target = pending is null ? null : plan?.At(plan.Position), requestId = pending is null ? null : pendingRequestId,
-                version, busy = pending is not null, preparation = preparer?.Status };
+                version, busy = pending is not null, preparation = preparer?.Status,
+                radio = new { enabled = engine.RadioEnabled, advancing = automaticPending, error = radioError } };
         }
     }
 
@@ -52,6 +55,31 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
     public Task PlayAsync(Track track, string? requestId, CancellationToken token = default, string? clientId = null, long? commandSequence = null) => ChangeAsync(track, 0, requestId, token, clientId: clientId, commandSequence: commandSequence);
     public Task NextAsync(string? requestId, CancellationToken token = default, string? expectedId = null, long? expectedRevision = null, string? clientId = null, long? commandSequence = null, string? navigationId = null, long? navigationOffset = null, Track? anchor = null) => ChangeAsync(null, 1, requestId, token, expectedId, expectedRevision, clientId, commandSequence, navigationId, navigationOffset, anchor);
     public Task PreviousAsync(string? requestId, CancellationToken token = default, string? expectedId = null, long? expectedRevision = null, string? clientId = null, long? commandSequence = null, string? navigationId = null, long? navigationOffset = null, Track? anchor = null) => ChangeAsync(null, -1, requestId, token, expectedId, expectedRevision, clientId, commandSequence, navigationId, navigationOffset, anchor);
+
+    public Task AdvanceAutomaticallyAsync(long endedRevision, CancellationToken token = default) =>
+        ChangeAsync(null, 1, "radio-" + Guid.NewGuid().ToString("N"), token, automaticFromRevision: endedRevision);
+
+    public async Task PrepareRadioAsync(long revision, CancellationToken token)
+    {
+        long expectedVersion;
+        lock (gate)
+        {
+            if (!engine.RadioEnabled || !engine.Ready || pending is not null || engine.Revision != revision)
+                throw new SelectionSupersededException();
+            expectedVersion = version;
+        }
+        await PreviewAsync(revision, expectedVersion, token);
+    }
+
+    public void AutomaticFailed(long endedRevision)
+    {
+        lock (gate)
+        {
+            if (!engine.RadioEnabled || pending is not null || engine.Revision != endedRevision || engine.NaturallyEndedRevision != endedRevision) return;
+            radioError = "Не удалось включить следующую песню. Нажми ⏭, чтобы попробовать ещё раз, или выбери другую.";
+            engine.ReleaseEndedStream(endedRevision);
+        }
+    }
 
     public async Task<NavigationPreview> PreviewAsync(long revision, long expectedVersion, CancellationToken token = default)
     {
@@ -194,7 +222,7 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
 
     private async Task ChangeAsync(Track? selected, int direction, string? requestId, CancellationToken token,
         string? expectedId = null, long? expectedRevision = null, string? clientId = null, long? commandSequence = null,
-        string? navigationId = null, long? navigationOffset = null, Track? anchor = null)
+        string? navigationId = null, long? navigationOffset = null, Track? anchor = null, long? automaticFromRevision = null)
     {
         CancellationTokenSource own;
         SelectionPlan selectionPlan;
@@ -202,6 +230,9 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
         bool completed = false;
         lock (gate)
         {
+            if (automaticFromRevision.HasValue && (!engine.RadioEnabled || pending is not null ||
+                engine.Revision != automaticFromRevision || engine.NaturallyEndedRevision != automaticFromRevision))
+                throw new SelectionSupersededException();
             AcceptCommand(clientId, commandSequence);
             if (expectedRevision.HasValue && expectedRevision != engine.Revision) throw new SelectionSupersededException();
             if ((navigationId is null) != (navigationOffset is null) || navigationId?.Length is 0 or > 64)
@@ -234,6 +265,8 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
             var previous = pending;
             pending = own = CancellationTokenSource.CreateLinkedTokenSource(token);
             pendingRequestId = requestId ??= Guid.NewGuid().ToString("N");
+            automaticPending = automaticFromRevision.HasValue; radioError = null;
+            if (direction == 0) engine.RadioEnabled = selected?.Provider == "youtube";
             currentVersion = ++version;
             // Cancellation can run the previous task's finally synchronously.
             // Publish its replacement first so it cannot roll back this plan.
@@ -249,9 +282,10 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
                 if (plan != selectionPlan || currentVersion != version) throw new SelectionSupersededException();
                 selected = selectionPlan.At(targetPosition)!;
                 if (expectedId is not null && selected.Id != expectedId) throw new SelectionSupersededException();
+                if (!automaticFromRevision.HasValue) engine.RadioEnabled = selected.Provider == "youtube";
                 preparer?.CancelUnless(selected.Id);
             }
-            await engine.PlayAsync(selected, requestId, own.Token);
+            await engine.PlayAsync(selected, requestId, own.Token, automaticFromRevision);
             lock (gate)
             {
                 own.Token.ThrowIfCancellationRequested();
@@ -286,7 +320,7 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
                 if (ReferenceEquals(pending, own))
                 {
                     if (!completed && plan == selectionPlan) RestoreQueue();
-                    pending = null; pendingRequestId = null;
+                    pending = null; pendingRequestId = null; automaticPending = false;
                 }
                 own.Dispose();
             }
@@ -305,7 +339,8 @@ public sealed class PlaybackNavigator(AudioEngine engine, IMusicProvider catalog
         lock (gate)
         {
             AcceptCommand(clientId, commandSequence);
-            ++version; var previous = pending; pending = null; pendingRequestId = null; previous?.Cancel();
+            ++version; var previous = pending; pending = null; pendingRequestId = null; automaticPending = false;
+            engine.RadioEnabled = false; radioError = null; previous?.Cancel();
             RestoreQueue(); CancelRadio(clear: false); preparer?.Schedule(null, () => false);
         }
         await engine.StopPlaybackAsync();
