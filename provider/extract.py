@@ -1,9 +1,14 @@
-"""Disposable extraction process: cancelled selections also terminate their JS runtime."""
+"""Disposable extraction process with a validated fast client and standard fallback."""
 import json
 import os
 import re
+import signal
 import sys
+import time
+from urllib.parse import urlparse
+import requests
 import yt_dlp
+from yt_dlp.extractor.youtube import YoutubeIE
 
 
 class QuietLogger:
@@ -12,18 +17,67 @@ class QuietLogger:
     def error(self, *_): pass
 
 
+class FastClientTimeout(Exception): pass
+
+
+def validate_audio(info, proxy):
+    if info.get('is_live') or info.get('has_drm'):
+        raise ValueError('Unsupported source')
+    source = info.get('url', '')
+    host = urlparse(source).hostname or ''
+    if not source.startswith('https://') or not host.endswith('.googlevideo.com'):
+        raise ValueError('Unexpected media host')
+    headers = info.get('http_headers', {})
+    with requests.Session() as session:
+        session.trust_env = False
+        if proxy: session.proxies.update({'http':proxy,'https':proxy})
+        with session.get(source, headers={**headers,'Range':'bytes=0-4095'}, stream=True, timeout=(5,8)) as response:
+            response.raise_for_status()
+            if not next(response.iter_content(4096), b''):
+                raise ValueError('Empty audio')
+    return {'url':source,'headers':headers,'unsupported':False}
+
+
+def prepare(video_id):
+    started = time.monotonic()
+    proxy = os.environ.get('YOUTUBE_PROXY','').strip()
+    base = {'format':'bestaudio[ext=m4a]/bestaudio','quiet':True,'no_warnings':True,
+            'logger':QuietLogger(),'noplaylist':True,'cachedir':'/tmp/yt-dlp-cache',
+            'socket_timeout':12,'retries':1,'extractor_retries':1,'proxy':proxy}
+    for strategy in ('visionos','standard'):
+        options = dict(base)
+        fast = strategy == 'visionos'
+        if fast:
+            options.update({'socket_timeout':6,'retries':0,'extractor_retries':0,
+                            'extractor_args':{'youtube':{'player_client':['visionos'],'skip':['hls','dash']}}})
+        else: options['js_runtimes'] = {'node':{}}
+        previous_handler = None
+        timer_set = False
+        try:
+            if fast:
+                def expire(*_): raise FastClientTimeout()
+                previous_handler = signal.signal(signal.SIGALRM, expire)
+                signal.setitimer(signal.ITIMER_REAL, 18)
+                timer_set = True
+            with yt_dlp.YoutubeDL(options, auto_init=not fast) as downloader:
+                if fast: downloader.add_info_extractor(YoutubeIE())
+                info = downloader.extract_info('https://www.youtube.com/watch?v=' + video_id, download=False)
+            extracted = time.monotonic()
+            result = validate_audio(info, proxy)
+            result.update({'strategy':strategy,'extractMilliseconds':round((extracted-started)*1000),
+                           'probeMilliseconds':round((time.monotonic()-extracted)*1000)})
+            return result
+        except Exception:
+            if not fast: raise
+        finally:
+            if timer_set:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous_handler)
+    raise ValueError('No audio source')
+
+
 if __name__ == '__main__':
     video_id = sys.argv[1]
-    if not re.fullmatch(r'[a-zA-Z0-9_-]{11}', video_id):
-        raise SystemExit(2)
-    options = {'format':'bestaudio[ext=m4a]/bestaudio', 'quiet':True, 'no_warnings':True,
-               'logger':QuietLogger(), 'noplaylist':True, 'cachedir':'/tmp/yt-dlp-cache',
-               'socket_timeout':12, 'retries':1, 'extractor_retries':1,
-               'js_runtimes':{'node':{}}, 'proxy':os.environ.get('YOUTUBE_PROXY','').strip()}
-    try:
-        with yt_dlp.YoutubeDL(options) as downloader:
-            info = downloader.extract_info('https://www.youtube.com/watch?v=' + video_id, download=False)
-        print(json.dumps({'url':info.get('url',''), 'headers':info.get('http_headers',{}),
-                          'unsupported':bool(info.get('is_live') or info.get('has_drm'))}))
-    except Exception:
-        raise SystemExit(1)
+    if not re.fullmatch(r'[a-zA-Z0-9_-]{11}', video_id): raise SystemExit(2)
+    try: print(json.dumps(prepare(video_id)))
+    except Exception: raise SystemExit(1)

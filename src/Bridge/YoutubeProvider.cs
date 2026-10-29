@@ -63,9 +63,9 @@ public sealed class YoutubeProvider(IConfiguration config) : ITrackRecommendatio
         catch { throw new ProviderException("Не удалось загрузить следующие песни."); }
     }
 
-    public async Task<(byte[] Bytes, string ContentType)> ArtworkAsync(Track track, CancellationToken cancellationToken)
+    public async Task<(byte[] Bytes, string ContentType)> ArtworkAsync(Track track, CancellationToken cancellationToken, bool preview = false)
     {
-        using var response = await client.GetAsync(BaseUrl + "/artwork?id=" + Uri.EscapeDataString(track.Id[8..]), cancellationToken);
+        using var response = await client.GetAsync(BaseUrl + "/artwork?id=" + Uri.EscapeDataString(track.Id[8..]) + (preview ? "&size=small" : ""), cancellationToken);
         if (!response.IsSuccessStatusCode) throw new ProviderException("Обложка недоступна.");
         var contentType = response.Content.Headers.ContentType?.MediaType;
         if (contentType is not ("image/jpeg" or "image/png" or "image/webp"))
@@ -94,7 +94,9 @@ public sealed class YoutubeProvider(IConfiguration config) : ITrackRecommendatio
                 }
                 if (!response.IsSuccessStatusCode)
                     throw new ProviderException("Не удалось получить эту запись YouTube. Попробуй другую версию трека.");
-                return new AudioSource(BaseUrl + "/audio?id=" + id, false);
+                var resolution = await response.Content.ReadFromJsonAsync<Resolution>(cancellationToken);
+                return new AudioSource(BaseUrl + "/audio?id=" + id, false, resolution?.Strategy,
+                    resolution?.ExtractMilliseconds ?? 0, resolution?.ProbeMilliseconds ?? 0);
             }
             throw new ProviderException("Источник занят. Попробуй ещё раз.");
         }
@@ -102,4 +104,6 @@ public sealed class YoutubeProvider(IConfiguration config) : ITrackRecommendatio
         catch (ProviderException) { throw; }
         catch { throw new ProviderException("Не удалось подготовить трек YouTube. Текущий эфир сохранён."); }
     }
+
+    private sealed record Resolution(string? Strategy, int ExtractMilliseconds, int ProbeMilliseconds);
 }

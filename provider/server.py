@@ -91,22 +91,26 @@ def radio(video_id):
     return tracks
 
 
-def artwork(video_id):
+def artwork(video_id, preview=False):
+    key = (video_id, preview)
     with cache_lock:
-        cached = artwork_cache.get(video_id)
+        cached = artwork_cache.get(key)
         if cached:
-            artwork_cache.move_to_end(video_id)
+            artwork_cache.move_to_end(key)
             return cached
     # Watch metadata includes the album art at up to 544px, unlike the 120px
     # preview returned by search. Reuse this request later for the Next button.
-    try: radio(video_id)
-    except Exception: pass
+    if not preview:
+        try: radio(video_id)
+        except Exception: pass
     with cache_lock:
         track = track_cache.get(video_id)
     url = (track or {}).get('thumbnail') or ''
     host = urlparse(url).hostname or ''
     if not url.startswith('https://') or not (host == 'i.ytimg.com' or host.endswith('.googleusercontent.com')):
         raise ValueError('No supported artwork')
+    if preview and host.endswith('.googleusercontent.com'):
+        url = re.sub(r'=w\d+-h\d+', '=w96-h96', url)
     with NetworkSession() as session:
         with session.get(url, stream=True, allow_redirects=False) as response:
             response.raise_for_status()
@@ -122,7 +126,7 @@ def artwork(video_id):
     result = (b''.join(chunks), content_type)
     if not result[0]: raise ValueError('Empty artwork')
     with cache_lock:
-        artwork_cache[video_id] = result
+        artwork_cache[key] = result
         while sum(len(item[0]) for item in artwork_cache.values()) > 8 * 1024 * 1024:
             artwork_cache.popitem(last=False)
     return result
@@ -167,7 +171,7 @@ def resolve(video_id, cancelled=None):
         cached = audio_cache.get(video_id)
         if cached is not None and time.monotonic() - cached[0] < 1200:
             audio_cache.move_to_end(video_id)
-            return
+            return {'strategy':'cache','extractMilliseconds':0,'probeMilliseconds':0}
     info = extract_source(video_id, cancelled)
     if info.get("unsupported"):
         raise ValueError("Unsupported source")
@@ -176,17 +180,14 @@ def resolve(video_id, cancelled=None):
     if not source.startswith("https://") or not host.endswith(".googlevideo.com"):
         raise ValueError("Unexpected media host")
     headers = info.get("headers", {})
-    # Resolve before switching the shared player; inaccessible audio leaves it running.
-    with NetworkSession() as session:
-        with session.get(source, headers={**headers, "Range": "bytes=0-4095"}, stream=True) as response:
-            response.raise_for_status()
-            if not next(response.iter_content(4096), b""):
-                raise ValueError("Empty audio source")
+    # The disposable helper has already validated the first audio bytes, including
+    # the fast client's URL. Do not repeat that network round trip here.
     with cache_lock:
         audio_cache[video_id] = (time.monotonic(), source, headers)
         audio_cache.move_to_end(video_id)
         while len(audio_cache) > 24:
             audio_cache.popitem(last=False)
+    return {key:info.get(key) for key in ('strategy','extractMilliseconds','probeMilliseconds')}
 
 
 def forward_audio(handler, source, headers):
@@ -271,7 +272,7 @@ class Handler(BaseHTTPRequestHandler):
             if not artwork_slots.acquire(timeout=5):
                 return self.send_json(503, {'error':'Artwork busy'})
             try:
-                data, content_type = artwork(video_id)
+                data, content_type = artwork(video_id, params.get('size',[''])[0] == 'small')
                 self.send_response(200)
                 self.send_header('Content-Type', content_type)
                 self.send_header('Content-Length', str(len(data)))
@@ -294,8 +295,8 @@ class Handler(BaseHTTPRequestHandler):
             if not VIDEO_ID.fullmatch(video_id):
                 return self.send_json(400, {"error": "Некорректный идентификатор трека."})
             if url.path == "/resolve":
-                resolve(video_id, self.disconnected)
-                return self.send_json(200, {"ready": True})
+                timings = resolve(video_id, self.disconnected)
+                return self.send_json(200, {"ready": True, **timings})
             if url.path == '/radio':
                 return self.send_json(200, radio(video_id))
             if url.path == "/audio":

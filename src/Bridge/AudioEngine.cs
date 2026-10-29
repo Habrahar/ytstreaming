@@ -21,6 +21,9 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
     private long resolveMilliseconds;
     private long startedAtTicks;
     private long startupMilliseconds;
+    private string? sourceStrategy;
+    private int sourceExtractMilliseconds;
+    private int sourceProbeMilliseconds;
     private readonly object listenersLock = new();
     private readonly Dictionary<Guid, Channel<byte[]>> listeners = new();
     private Process? process;
@@ -44,6 +47,7 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
             lock (listenersLock) return new { state, ready = Ready, track = Current, pending,
                 revision = Revision, requestId = activeRequestId, latestRequestId, error = lastError,
                 resolveMilliseconds, startupMilliseconds,
+                sourceStrategy, sourceExtractMilliseconds, sourceProbeMilliseconds,
                 listeners = listeners.Count, bytesSentToHub = Interlocked.Read(ref bytes),
                 stream = "/stream.mp3", provider = Current?.Provider,
                 youtubeMusic = string.IsNullOrEmpty(config["YOUTUBE_PROVIDER_URL"]) ? "not-configured" : "enabled" };
@@ -91,6 +95,9 @@ public sealed class AudioEngine(IMusicProvider provider, IConfiguration config, 
             activeRequestId = requestId;
             Interlocked.Increment(ref revision);
             resolveMilliseconds = watch.ElapsedMilliseconds;
+            sourceStrategy = source.Strategy;
+            sourceExtractMilliseconds = source.ExtractMilliseconds;
+            sourceProbeMilliseconds = source.ProbeMilliseconds;
             startupMilliseconds = 0;
             startedAtTicks = Stopwatch.GetTimestamp();
             var info = new ProcessStartInfo(config["FFMPEG_PATH"] ?? "ffmpeg")

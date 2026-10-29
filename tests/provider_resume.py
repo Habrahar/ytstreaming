@@ -30,6 +30,25 @@ class Handler:
 
 
 class ResumeCheck(unittest.TestCase):
+    def test_search_preview_does_not_fetch_radio_or_share_fullsize_cache(self):
+        fetched=[]
+        class Session:
+            def __enter__(self): return self
+            def __exit__(self,*_): pass
+            def get(self,url,**kwargs):
+                fetched.append(url)
+                return Response(200,[b'image'],{'Content-Type':'image/jpeg'})
+        with patch.dict(server.track_cache, {'AAAAAAAAAAA':{'thumbnail':'https://yt3.googleusercontent.com/art=w544-h544-l90-rj'}},clear=True), \
+             patch.dict(server.artwork_cache,{},clear=True),patch.object(server,'radio',return_value=[]) as radio, \
+             patch.object(server,'NetworkSession',Session):
+            self.assertEqual(server.artwork('AAAAAAAAAAA',preview=True),(b'image','image/jpeg'))
+            radio.assert_not_called()
+            self.assertIn('=w96-h96',fetched[0])
+            server.artwork('AAAAAAAAAAA')
+            radio.assert_called_once()
+            self.assertEqual(len(fetched),2)
+            self.assertIn('=w544-h544',fetched[1])
+
     def test_radio_metadata_uses_largest_artwork_and_deduplicates(self):
         tracks = server.normalize_tracks([{'videoId':'AAAAAAAAAAA','title':'Song','artists':None,
             'length':'3:10','thumbnail':[{'url':'https://i.ytimg.com/small.jpg','width':120},

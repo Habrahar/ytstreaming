@@ -3,7 +3,7 @@ namespace Bridge;
 // Catalog and playback resolution are separate contracts. A future catalog
 // adapter must not assume that metadata grants permission/access to audio.
 public record Track(string Id, string Title, string Artist, string Provider, string? Duration = null, string? Thumbnail = null);
-public record AudioSource(string Location, bool Loop);
+public record AudioSource(string Location, bool Loop, string? Strategy = null, int ExtractMilliseconds = 0, int ProbeMilliseconds = 0);
 public interface IMusicProvider
 {
     Track[] Search(string? query);

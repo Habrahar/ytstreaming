@@ -69,7 +69,7 @@ app.MapGet("/api/artwork/{videoId}", async (string videoId, MusicCatalog catalog
     var id = "youtube:" + videoId;
     var track = catalog.Find(id) ?? navigator.Find(id) ?? (engine.Current?.Id == id ? engine.Current : null);
     if (track is null) return Results.NotFound();
-    var artwork = await youtube.ArtworkAsync(track, context.RequestAborted);
+    var artwork = await youtube.ArtworkAsync(track, context.RequestAborted, context.Request.Query["size"] == "small");
     context.Response.Headers.CacheControl = "private, max-age=3600";
     return Results.File(artwork.Bytes, artwork.ContentType);
 });
