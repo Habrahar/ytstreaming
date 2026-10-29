@@ -33,3 +33,16 @@ oauth*.json
 browser*.json
 __pycache__/
 *.py[cod]
+
+# Local notes and tools
+/docs/
+/scripts/ssh-pi.ps1
+/scripts/inventory.sh
+*.code-workspace
+.agents/
+.codex/
+.claude/
+.cursor/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
