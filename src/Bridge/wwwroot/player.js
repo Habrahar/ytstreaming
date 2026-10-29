@@ -6,6 +6,11 @@ let searchRequest = null, searchSequence = 0, searchTimer, intentionalReset = fa
 let completedSearch = '';
 let artworkTrack = null;
 const searchArt = new TrackArtLoader($('#results'));
+const mediaControls = new PlayerMediaControls(navigator.mediaSession,window.MediaMetadata,{
+  play:resumePlayback,pause:pausePlayback,
+  previous:()=>{if(server?.navigation?.canPrevious) navigate('previous');},
+  next:()=>{if(server?.track?.provider==='youtube') navigate('next');}
+});
 function stopThumbnails(release=false) { searchArt.stop(release); }
 function watchThumbnails() { searchArt.watch(); }
 
@@ -45,11 +50,9 @@ function render() {
   $('#play').setAttribute('aria-label', playing ? 'Пауза' : 'Воспроизвести');
   $('#playIcon').textContent = playing ? 'Ⅱ' : '▶';
   $('#cover').classList.toggle('spinning', phase === 'playing' && !pending);
-  if ('mediaSession' in navigator && isMusic) {
-    navigator.mediaSession.metadata = new MediaMetadata({title:track.title, artist:track.artist,
-      artwork:artworkUrl?[{src:new URL(artworkUrl,location.href).href}]:[]});
-    navigator.mediaSession.playbackState = phase === 'playing' ? 'playing' : 'paused';
-  }
+  const mediaState=!isMusic || phase==='idle'?'none':
+    wantsAudio && !['error','gesture','ended'].includes(phase)?'playing':'paused';
+  mediaControls.update(track,artworkUrl?new URL(artworkUrl,location.href).href:null,mediaState);
   window.libraryUI?.renderCurrent(track);
 }
 
@@ -108,10 +111,21 @@ function navigate(direction) {
 }
 
 function togglePlayback() {
+  if (wantsAudio && !audio.paused) pausePlayback();
+  else resumePlayback();
+}
+
+function pausePlayback() {
+  wantsAudio=false; audio.pause(); phase='paused'; render();
+}
+
+function resumePlayback() {
   notice();
-  if (wantsAudio && !audio.paused) {
-    wantsAudio = false; audio.pause(); phase = 'paused'; render(); return;
+  if(pending) {
+    if(!wantsAudio) {wantsAudio=true; connect('requestId='+encodeURIComponent(pending.requestId));}
+    return;
   }
+  if(wantsAudio && !audio.paused) return;
   if (!server?.track || server.track.provider !== 'youtube') return;
   wantsAudio = true;
   if (server.ready) {
@@ -206,7 +220,9 @@ $('#stop').onclick=async()=>{
   ++selectionSequence; controlRequest?.abort(); pending=null; wantsAudio=false; disconnect(); phase='idle'; render();
   try { server=await api('/api/player/stop',{}); render(); } catch(error) { notice(error.message); }
 };
-audio.onplaying=()=>{ phase='playing'; notice(); render(); };
+audio.onplaying=()=>{ mediaControls.register(); phase='playing'; notice(); render(); };
+audio.addEventListener('loadedmetadata',()=>mediaControls.register());
+window.addEventListener('pageshow',()=>{mediaControls.register(); render();});
 audio.onwaiting=()=>{ if(wantsAudio) { phase='buffering'; render(); } };
 audio.onpause=()=>{ if(!intentionalReset && !pending && !wantsAudio) { phase='paused'; render(); } };
 audio.onended=async()=>{
@@ -227,10 +243,4 @@ audio.onended=async()=>{
   } catch { phase='error'; notice('Связь прервалась. Нажми ▶ для подключения.'); render(); }
 };
 audio.onerror=()=>{ if(!intentionalReset && !pending && wantsAudio) { phase='error'; notice('Звук прервался. Нажми ▶ для подключения.'); render(); } };
-if ('mediaSession' in navigator) {
-  navigator.mediaSession.setActionHandler('play',togglePlayback);
-  navigator.mediaSession.setActionHandler('pause',()=>{ wantsAudio=false; audio.pause(); phase='paused'; render(); });
-  navigator.mediaSession.setActionHandler('previoustrack',()=>navigate('previous'));
-  navigator.mediaSession.setActionHandler('nexttrack',()=>navigate('next'));
-}
 search(); refresh(); setInterval(refresh,1500);
