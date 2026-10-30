@@ -16,6 +16,8 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<AudioEngine>());
 builder.Services.AddHostedService<RadioPlaybackService>();
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 4096);
 var app = builder.Build();
+var forwardedHeaders = ReverseProxySupport.CreateOptions(builder.Configuration["TRUSTED_PROXY_IPS"]);
+if (forwardedHeaders is not null) app.UseForwardedHeaders(forwardedHeaders);
 var musicLibrary = app.Services.GetRequiredService<MusicLibrary>();
 var statusJsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 JsonNode PlayerStatus(AudioEngine engine, PlaybackNavigator navigator)
@@ -33,12 +35,7 @@ app.Use(async (context, next) =>
     context.Response.Headers["Referrer-Policy"] = "no-referrer";
     if (HttpMethods.IsPost(context.Request.Method))
     {
-        var origin = context.Request.Headers.Origin.ToString();
-        var sameOrigin = string.IsNullOrEmpty(origin) ||
-            (Uri.TryCreate(origin, UriKind.Absolute, out var uri) &&
-             uri.Authority.Equals(context.Request.Host.Value, StringComparison.OrdinalIgnoreCase) &&
-             uri.Scheme == context.Request.Scheme);
-        if (!sameOrigin || !context.Request.HasJsonContentType())
+        if (!ReverseProxySupport.IsSameOrigin(context.Request) || !context.Request.HasJsonContentType())
         {
             context.Response.StatusCode = 403;
             return;
