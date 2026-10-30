@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [ytstreaming, ytstreaming-provider, ytstreaming-tunnel, ytstreaming-access]
+        image: [ytstreaming, ytstreaming-provider, ytstreaming-tunnel, ytstreaming-access, ytstreaming-auth]
         arch: [amd64, arm64]
         include:
           - arch: amd64
@@ -39,6 +39,8 @@ jobs:
             dockerfile: tunnel/Dockerfile
           - image: ytstreaming-access
             dockerfile: access/Dockerfile
+          - image: ytstreaming-auth
+            dockerfile: auth/Dockerfile
     env:
       IMAGE: ghcr.io/habrahar/${{ matrix.image }}
       IMAGE_TAG: sha-${{ github.sha }}-${{ matrix.arch }}
@@ -81,6 +83,20 @@ jobs:
               --security-opt no-new-privileges --entrypoint caddy "$IMAGE:$IMAGE_TAG" version
             exit 0
           fi
+          if [ "$COMPONENT" = ytstreaming-auth ]; then
+            python3 -c 'import json,secrets; print(json.dumps(dict(username="smoke",password=secrets.token_hex(20))))' | \
+              docker run --rm -i --network none "$IMAGE:$IMAGE_TAG" --hash > "$RUNNER_TEMP/auth.json"
+            chmod 644 "$RUNNER_TEMP/auth.json"
+            trap 'docker logs image-check; docker rm -f image-check >/dev/null' EXIT
+            docker run -d --name image-check --network none --read-only --cap-drop ALL \
+              --security-opt no-new-privileges --tmpfs /state:rw,uid=1654,gid=1654,size=16m \
+              -v "$RUNNER_TEMP/auth.json:/run/auth.json:ro" "$IMAGE:$IMAGE_TAG"
+            for attempt in $(seq 1 20); do
+              if docker exec image-check dotnet Auth.dll --health; then exit 0; fi
+              sleep 1
+            done
+            exit 1
+          fi
           trap 'docker logs image-check; docker rm -f image-check >/dev/null' EXIT
           docker run -d --name image-check --network none --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=16m \
@@ -115,7 +131,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        image: [ytstreaming, ytstreaming-provider, ytstreaming-tunnel, ytstreaming-access]
+        image: [ytstreaming, ytstreaming-provider, ytstreaming-tunnel, ytstreaming-access, ytstreaming-auth]
     env:
       IMAGE: ghcr.io/habrahar/${{ matrix.image }}
     steps:
