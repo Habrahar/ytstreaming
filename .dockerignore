@@ -4,6 +4,9 @@
 !tunnel/
 tunnel/**
 !tunnel/Dockerfile
+!access/
+access/**
+!access/Dockerfile
 !provider/
 provider/**
 !provider/Dockerfile
