@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [ytstreaming, ytstreaming-provider]
+        image: [ytstreaming, ytstreaming-provider, ytstreaming-tunnel]
         arch: [amd64, arm64]
         include:
           - arch: amd64
@@ -35,6 +35,8 @@ jobs:
             dockerfile: Dockerfile
           - image: ytstreaming-provider
             dockerfile: provider/Dockerfile
+          - image: ytstreaming-tunnel
+            dockerfile: tunnel/Dockerfile
     env:
       IMAGE: ghcr.io/habrahar/${{ matrix.image }}
       IMAGE_TAG: sha-${{ github.sha }}-${{ matrix.arch }}
@@ -67,6 +69,11 @@ jobs:
           COMPONENT: ${{ matrix.image }}
         run: |
           set -eu
+          if [ "$COMPONENT" = ytstreaming-tunnel ]; then
+            docker run --rm --network none --read-only --cap-drop ALL \
+              --security-opt no-new-privileges "$IMAGE:$IMAGE_TAG" -V
+            exit 0
+          fi
           trap 'docker logs image-check; docker rm -f image-check >/dev/null' EXIT
           docker run -d --name image-check --network none --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=16m \
@@ -101,7 +108,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        image: [ytstreaming, ytstreaming-provider]
+        image: [ytstreaming, ytstreaming-provider, ytstreaming-tunnel]
     env:
       IMAGE: ghcr.io/habrahar/${{ matrix.image }}
     steps:

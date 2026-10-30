@@ -1,6 +1,9 @@
 **
 !Dockerfile
 !Dockerfile.runtime
+!tunnel/
+tunnel/**
+!tunnel/Dockerfile
 !provider/
 provider/**
 !provider/Dockerfile
