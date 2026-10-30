@@ -70,7 +70,10 @@ public static class AuthHost
         {
             context.Response.Headers.CacheControl = "no-store";
             context.Response.Headers["X-Content-Type-Options"] = "nosniff";
-            context.Response.Headers["Referrer-Policy"] = "no-referrer";
+            // Native form POSTs use an opaque Origin under no-referrer.
+            // Keep the origin available for same-site CSRF validation.
+            context.Response.Headers["Referrer-Policy"] = "same-origin";
+            context.Response.Headers.ContentDisposition = "inline";
             context.Response.Headers.ContentSecurityPolicy = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
             await next(context);
         });
@@ -78,42 +81,44 @@ public static class AuthHost
         app.UseRateLimiter();
         app.MapGet("/health", () => Results.Ok(new { ready = true }));
         app.MapGet("/login", (HttpContext context) => Results.Content(Page(context.Request.Query.ContainsKey("error") ? "Не получилось войти. Проверь логин и пароль." : "", false), "text/html; charset=utf-8"));
+        app.MapGet("/auth/login", (HttpContext context) => RedirectPage(context, "/login"));
         app.MapPost("/auth/login", async (HttpContext context) =>
         {
-            if (!SameOrigin(context.Request) || !context.Request.HasFormContentType) return Results.StatusCode(403);
+            if (!SameOrigin(context.Request))
+                return Results.Content(Page("Обнови страницу входа и попробуй ещё раз.", false), "text/html; charset=utf-8", statusCode: 403);
+            if (!context.Request.HasFormContentType)
+                return Results.Content(Page("Не удалось прочитать форму. Повтори вход.", false), "text/html; charset=utf-8", statusCode: 400);
             var form = await context.Request.ReadFormAsync(context.RequestAborted);
             var username = form["username"].ToString();
             var supplied = form["password"].ToString();
-            if (supplied.Length > 256) return Results.StatusCode(400);
+            if (supplied.Length > 256)
+                return Results.Content(Page("Пароль слишком длинный.", false), "text/html; charset=utf-8", statusCode: 400);
             var validPassword = new PasswordHasher<string>().VerifyHashedPassword(credentials.Username, credentials.PasswordHash, supplied)
                 != PasswordVerificationResult.Failed;
-            if (!validPassword || username != credentials.Username) return Results.Redirect("/login?error=1", false, false);
+            if (!validPassword || username != credentials.Username) return RedirectPage(context, "/login?error=1");
             var identity = new ClaimsIdentity(new[] { new Claim(ClaimTypes.Name, credentials.Username), new Claim("auth-version", version) }, "session");
             await context.SignInAsync("session", new ClaimsPrincipal(identity), new AuthenticationProperties
             {
                 IsPersistent = form["remember"] == "on",
                 AllowRefresh = true
             });
-            context.Response.StatusCode = 303;
-            context.Response.Headers.Location = "/";
-            return Results.Empty;
+            return RedirectPage(context, "/");
         }).RequireRateLimiting("login");
         app.MapGet("/auth/check", (HttpContext context) =>
         {
             if (context.User.Identity?.IsAuthenticated == true) return Results.Ok();
             var uri = context.Request.Headers["X-Forwarded-Uri"].ToString().Split('?', 2)[0];
             if (context.Request.Headers["X-Forwarded-Method"] == "GET" && uri is "/" or "/index.html")
-                return Results.Redirect("/login");
+                return RedirectPage(context, "/login");
             return Results.Json(new { error = "Нужно войти в плеер." }, statusCode: 401);
         });
         app.MapGet("/auth/logout", () => Results.Content(Page("", true), "text/html; charset=utf-8"));
         app.MapPost("/auth/logout", async (HttpContext context) =>
         {
-            if (!SameOrigin(context.Request)) return Results.StatusCode(403);
+            if (!SameOrigin(context.Request))
+                return Results.Content(Page("Обнови страницу и повтори выход.", true), "text/html; charset=utf-8", statusCode: 403);
             await context.SignOutAsync("session");
-            context.Response.StatusCode = 303;
-            context.Response.Headers.Location = "/login";
-            return Results.Empty;
+            return RedirectPage(context, "/login");
         });
         return app;
     }
@@ -121,6 +126,13 @@ public static class AuthHost
     private static bool SameOrigin(HttpRequest request) => request.IsHttps &&
         Uri.TryCreate(request.Headers.Origin, UriKind.Absolute, out var origin) &&
         origin.Scheme == "https" && origin.Authority.Equals(request.Host.Value, StringComparison.OrdinalIgnoreCase);
+
+    private static IResult RedirectPage(HttpContext context, string target)
+    {
+        context.Response.Headers.Location = target;
+        return Results.Content($"<!doctype html><html lang=\"ru\"><meta charset=\"utf-8\"><title>Переход · ytstreaming</title><a href=\"{WebUtility.HtmlEncode(target)}\">Продолжить</a></html>",
+            "text/html; charset=utf-8", statusCode: 303);
+    }
 
     private static string Page(string error, bool logout) => $$"""
 <!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Вход · ytstreaming</title>

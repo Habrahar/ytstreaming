@@ -38,15 +38,20 @@ string cookie;
 try
 {
     using var anonymous = await Send(client, "/auth/check");
-    Check(anonymous.StatusCode == HttpStatusCode.Redirect && anonymous.Headers.Location!.ToString() == "/login", "Anonymous page must redirect to login.");
+    Check(anonymous.StatusCode == HttpStatusCode.SeeOther && anonymous.Headers.Location!.ToString() == "/login", "Anonymous page must redirect to login.");
     Check(!anonymous.Headers.WwwAuthenticate.Any(), "Browser Basic Authentication prompt must never be returned.");
     using var page = await Send(client, "/login");
     Check(page.StatusCode == HttpStatusCode.OK && (await page.Content.ReadAsStringAsync()).Contains("Запомнить"), "A real login form must be available.");
+    Check(page.Headers.GetValues("Referrer-Policy").Single() == "same-origin", "Native form submissions must retain their same-origin Origin header.");
+    Check(page.Content.Headers.ContentType?.MediaType == "text/html" && page.Content.Headers.ContentDisposition?.DispositionType == "inline", "The login form must display as HTML, not download.");
     var form = new Dictionary<string,string> { ["username"] = "listener", ["password"] = secret, ["remember"] = "on" };
+    using var opaque = await Send(client, "/auth/login", form: form, origin: "null");
+    Check(opaque.StatusCode == HttpStatusCode.Forbidden && opaque.Content.Headers.ContentType?.MediaType == "text/html" && (await opaque.Content.ReadAsStringAsync()).Contains("Обнови"), "A stale no-referrer form must receive a readable HTML error without bypassing CSRF checks.");
     using var cross = await Send(client, "/auth/login", form: form, origin: "https://foreign.example.test");
     Check(cross.StatusCode == HttpStatusCode.Forbidden, "Cross-site login must be rejected.");
     using var signed = await Send(client, "/auth/login", form: form);
     Check(signed.StatusCode == HttpStatusCode.SeeOther, "Valid credentials must sign in.");
+    Check(signed.Content.Headers.ContentType?.MediaType == "text/html", "Successful form navigation must carry an explicit HTML type.");
     var header = signed.Headers.GetValues("Set-Cookie").Single();
     Check(header.Contains("secure", StringComparison.OrdinalIgnoreCase) && header.Contains("httponly", StringComparison.OrdinalIgnoreCase) && header.Contains("samesite=lax", StringComparison.OrdinalIgnoreCase), "Cookie must be Secure, HttpOnly and SameSite=Lax.");
     Check(header.Contains("expires=", StringComparison.OrdinalIgnoreCase) && header.StartsWith(AuthHost.CookieName + "="), "Remembered login must have a persistent host-only cookie.");
