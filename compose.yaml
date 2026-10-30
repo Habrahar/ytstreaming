@@ -1,10 +1,7 @@
 name: ytstreaming
 services:
   bridge:
-    image: ytstreaming:local
-    build:
-      context: .
-      dockerfile: ${DOCKERFILE:-Dockerfile}
+    image: ghcr.io/habrahar/ytstreaming:${IMAGE_TAG:-latest}
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8090}:8080"
     restart: unless-stopped
@@ -39,10 +36,7 @@ services:
         max-size: 5m
         max-file: "2"
   provider:
-    image: ytstreaming-provider:local
-    build:
-      context: .
-      dockerfile: provider/Dockerfile
+    image: ghcr.io/habrahar/ytstreaming-provider:${IMAGE_TAG:-latest}
     restart: unless-stopped
     init: true
     read_only: true

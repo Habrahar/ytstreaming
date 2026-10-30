@@ -1,0 +1,121 @@
+name: Docker images
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-images-main
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    name: Build ${{ matrix.image }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ytstreaming, ytstreaming-provider]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - image: ytstreaming
+            dockerfile: Dockerfile
+          - image: ytstreaming-provider
+            dockerfile: provider/Dockerfile
+    env:
+      IMAGE: ghcr.io/habrahar/${{ matrix.image }}
+      IMAGE_TAG: sha-${{ github.sha }}-${{ matrix.arch }}
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Build from committed source
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: "{{defaultContext}}"
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: ${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=${{ matrix.image }}
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
+      - name: Check container startup
+        env:
+          COMPONENT: ${{ matrix.image }}
+        run: |
+          set -eu
+          trap 'docker logs image-check; docker rm -f image-check >/dev/null' EXIT
+          docker run -d --name image-check --network none --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --tmpfs /data:rw,nosuid,size=16m,uid=1654,gid=1654 \
+            -e LIBRARY_DIRECTORY=/data "$IMAGE:$IMAGE_TAG"
+          ready=false
+          for attempt in $(seq 1 30); do
+            if [ "$COMPONENT" = ytstreaming ]; then
+              if docker exec image-check curl --fail --silent --max-time 2 http://127.0.0.1:8080/healthz; then
+                docker exec image-check ffmpeg -version >/dev/null
+                ready=true
+                break
+              fi
+            elif docker exec image-check python -c "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8081/healthz',timeout=2))['ready']"; then
+              docker exec image-check node --version
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+      - name: Push checked architecture
+        run: docker push "$IMAGE:$IMAGE_TAG"
+
+  publish:
+    name: Publish ${{ matrix.image }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        image: [ytstreaming, ytstreaming-provider]
+    env:
+      IMAGE: ghcr.io/habrahar/${{ matrix.image }}
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Publish multi-platform image
+        run: |
+          docker buildx imagetools create \
+            --tag "$IMAGE:sha-$GITHUB_SHA" --tag "$IMAGE:latest" \
+            "$IMAGE:sha-$GITHUB_SHA-amd64" "$IMAGE:sha-$GITHUB_SHA-arm64"
+          docker buildx imagetools inspect "$IMAGE:sha-$GITHUB_SHA"

@@ -1,0 +1,11 @@
+services:
+  bridge:
+    image: ytstreaming:local
+    build:
+      context: .
+      dockerfile: ${DOCKERFILE:-Dockerfile}
+  provider:
+    image: ytstreaming-provider:local
+    build:
+      context: .
+      dockerfile: provider/Dockerfile

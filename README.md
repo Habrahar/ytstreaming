@@ -14,24 +14,20 @@ cd ytstreaming
 cp .env.example .env
 ```
 
-В `.env` укажи локальный IP сервера в `BIND_ADDRESS`.
-
-На Raspberry Pi с 1 ГБ памяти сначала собери приложение на ПК с .NET SDK 8
-из копии этого проекта и передай результат на Pi:
-
-```powershell
-./scripts/publish.ps1
-ssh user@server 'mkdir -p ~/ytstreaming/artifacts'
-scp -r ./artifacts/publish user@server:ytstreaming/artifacts/
-```
-
-Замени `user@server` своим подключением. Для этого варианта в `.env` на Pi
-укажи `DOCKERFILE=Dockerfile.runtime`. На остальных серверах этот шаг можно пропустить.
-
-Запусти из папки проекта на сервере:
+В `.env` укажи локальный IP сервера в `BIND_ADDRESS`, затем запусти:
 
 ```sh
-docker compose up -d --build provider bridge
+docker compose pull
+docker compose up -d --no-build
 ```
 
+Готовые образы подходят и для Raspberry Pi с 64-битной ОС; сборка на сервере не нужна.
 Открой `http://<IP-сервера>:8090/` на телефоне в той же сети, найди песню и нажми на неё.
+
+Для обновления из папки проекта:
+
+```sh
+git pull --ff-only
+docker compose pull
+docker compose up -d --no-build
+```
